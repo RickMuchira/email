@@ -1,0 +1,1354 @@
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/app/api/auth/[...nextauth]/route.ts ---
+
+// /home/rick110/RickDrive/email_automation/frontend/app/api/auth/[...nextauth]/route.ts
+
+import NextAuth from "next-auth";
+import GoogleProvider from "next-auth/providers/google";
+
+// Helper function to refresh the Google access token
+async function refreshAccessToken(token: any) {
+  try {
+    const url =
+      "https://oauth2.googleapis.com/token?" +
+      new URLSearchParams({
+        client_id: process.env.GOOGLE_CLIENT_ID!,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET!,
+        grant_type: "refresh_token",
+        refresh_token: token.refreshToken,
+      });
+
+    const response = await fetch(url, {
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      method: "POST",
+    });
+
+    const refreshedTokens = await response.json();
+
+    if (!response.ok) {
+      throw refreshedTokens;
+    }
+
+    return {
+      ...token,
+      accessToken: refreshedTokens.access_token,
+      accessTokenExpires: Date.now() + refreshedTokens.expires_in * 1000, // in milliseconds
+      refreshToken: refreshedTokens.refresh_token ?? token.refreshToken, // Fall back to old refresh token
+    };
+  } catch (error) {
+    console.error("Error refreshing access token", error);
+    return { ...token, error: "RefreshAccessTokenError" };
+  }
+}
+
+const handler = NextAuth({
+  providers: [
+    GoogleProvider({
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+      authorization: {
+        params: {
+          // Request access to Gmail API scopes. Add more as needed.
+          scope: 'https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send',
+          access_type: "offline", // This is crucial for getting a refresh token
+          prompt: "consent", // This ensures the user is prompted for consent, which helps in getting a refresh token initially
+        },
+      },
+    }),
+  ],
+  callbacks: {
+    async jwt({ token, user, account }) {
+      // Initial sign in
+      if (account && user) {
+        return {
+          accessToken: account.access_token,
+          refreshToken: account.refresh_token,
+          accessTokenExpires: account.expires_at ? account.expires_at * 1000 : undefined, // Convert to milliseconds
+          user,
+        };
+      }
+
+      // Return previous token if the access token has not expired yet
+      if (token.accessTokenExpires && Date.now() < token.accessTokenExpires) {
+        return token;
+      }
+
+      // Access token has expired, try to update it
+      return refreshAccessToken(token);
+    },
+    async session({ session, token }) {
+      // Send properties to the client, such as an access_token from a provider.
+      session.accessToken = token.accessToken;
+      session.refreshToken = token.refreshToken; // Also expose refreshToken if you need it on the client
+      session.user = token.user; // Expose the user object
+      session.error = token.error; // Propagate any refresh errors
+      return session;
+    },
+  },
+  // You might want to add debug: true for development to see more logs
+  debug: process.env.NODE_ENV === 'development',
+});
+
+export { handler as GET, handler as POST };
+--- END OF /home/rick110/RickDrive/email_automation/frontend/app/api/auth/[...nextauth]/route.ts ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/app/dashboard/page.tsx ---
+
+import SendTokenToBackend from "@/components/SendTokenToBackend";
+
+export default function DashboardPage() {
+  return (
+    <main>
+      <h1>Dashboard</h1>
+      <SendTokenToBackend />
+    </main>
+  );
+}
+--- END OF /home/rick110/RickDrive/email_automation/frontend/app/dashboard/page.tsx ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/app/emails/page.tsx ---
+
+// /home/rick110/RickDrive/email_automation/frontend/app/emails/page.tsx
+
+"use client";
+
+import { useSession } from "next-auth/react";
+import { useEffect, useState, useCallback } from "react";
+import { useRouter } from "next/navigation";
+import SendEmailForm from "@/components/SendEmailForm";
+import Link from "next/link"; // Import Link
+
+// Updated interface to include sentiment, reply status, suggested reply, and full_body
+interface Email {
+  id: string;
+  from: string; // Changed from 'from_address' in DB to 'from' for frontend display
+  subject: string;
+  snippet: string;
+  sentiment: string; // e.g., 'POSITIVE', 'NEGATIVE', 'NEUTRAL', 'Error', 'N/A'
+  reply_status: string; // e.g., 'Not Replied', 'Pending User Review', 'User Replied', 'Processing Failed'
+  suggested_reply_body?: string; // Optional field for suggested replies
+  full_body?: string; // Optional full email body (though mostly used on detail page)
+}
+
+export default function EmailPage() {
+  const { data: session, status } = useSession();
+  const [emails, setEmails] = useState<Email[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const router = useRouter();
+
+  // Helper function to fetch and process emails (memoized with useCallback)
+  // Now accepts a boolean to determine if new emails should be fetched from Gmail
+  const fetchAndProcessEmails = useCallback(async (fetchNew: boolean = false) => {
+    if (!session?.accessToken) {
+      setError("Access token not found. Please try signing out and in again.");
+      setLoading(false);
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    try {
+      // Pass fetchNew parameter to the backend
+      const res = await fetch(`http://localhost:8000/api/read-emails?fetch_new=${fetchNew}&limit=20`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          access_token: session.accessToken,
+          refresh_token: session.refreshToken,
+          user_email: session.user?.email,
+        }),
+      });
+
+      if (!res.ok) {
+        const errData = await res.json();
+        throw new Error(errData.detail || `HTTP error! Status: ${res.status}`);
+      }
+
+      const data = await res.json();
+      setEmails(data.emails || []);
+    } catch (err: any) {
+      setError(`Failed to load and process emails: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [session]); // Dependency on session is fine, useCallback memoizes
+
+  useEffect(() => {
+    if (status === "loading") return;
+
+    if (status === "unauthenticated") {
+      router.push('/api/auth/signin');
+      return;
+    }
+
+    if (status === "authenticated") {
+      // On initial mount, fetch emails from the database (fetchNew = false)
+      // The "Refresh Emails" button will trigger fetchNew = true
+      fetchAndProcessEmails(false); 
+    }
+  }, [status, router, fetchAndProcessEmails]); // Dependency on fetchAndProcessEmails is okay because it's useCallback'd
+
+  // Helper function to determine badge color based on sentiment
+  const getSentimentClass = (sentiment: string) => {
+    switch (sentiment.toUpperCase()) {
+      case 'POSITIVE':
+        return 'bg-green-100 text-green-800';
+      case 'NEGATIVE':
+        return 'bg-red-100 text-red-800';
+      case 'NEUTRAL':
+        return 'bg-gray-100 text-gray-800';
+      case 'N/A':
+        return 'bg-blue-100 text-blue-800';
+      default:
+        return 'bg-yellow-100 text-yellow-800';
+    }
+  };
+
+  return (
+    <div className="p-6 font-sans">
+      <h1 className="text-3xl font-bold mb-6">📨 Gmail Automation Dashboard</h1>
+
+      <section className="mb-10 p-4 border rounded-lg bg-white shadow-sm">
+        <h2 className="text-xl font-semibold mb-3">Send a Manual Email</h2>
+        {/* SendEmailForm is already here and functional */}
+        <SendEmailForm />
+      </section>
+
+      <section>
+        <h2 className="text-2xl font-semibold mb-4">📬 Processed Emails (Unread & Unreplied)</h2>
+        <button
+          onClick={() => fetchAndProcessEmails(true)} // Explicitly fetch new emails from Gmail
+          className="mb-4 bg-purple-600 text-white px-4 py-2 rounded-md hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2"
+          disabled={loading} // Disable button while loading
+        >
+          {loading ? 'Refreshing...' : 'Refresh Emails from Gmail'}
+        </button>
+        {error && <p className="text-red-600 font-medium">Error: {error}</p>}
+        {!loading && !error && emails.length === 0 && (
+          <p className="text-gray-500">No unread or unreplied emails found to process.</p>
+        )}
+        <ul className="space-y-4">
+          {emails.map((email) => (
+            <Link key={email.id} href={`/emails/${email.id}`} passHref> {/* Link to detail page */}
+              <li className="block p-4 border rounded-lg bg-white shadow-sm hover:shadow-md transition-shadow cursor-pointer">
+                <div className="flex justify-between items-start mb-2">
+                  <p className="font-semibold text-gray-800">{email.from}</p>
+                  <div className="flex space-x-2">
+                      <span className={`text-xs font-medium px-2.5 py-0.5 rounded-full ${getSentimentClass(email.sentiment)}`}>
+                          {email.sentiment}
+                      </span>
+                  </div>
+                </div>
+                <p className="font-medium text-gray-900">{email.subject}</p>
+                <p className="text-sm text-gray-600 mt-1 mb-3">{email.snippet}</p>
+                <p className="text-sm font-medium text-blue-600">Status: {email.reply_status}</p>
+                {email.suggested_reply_body && email.reply_status === "Pending User Review" && (
+                    <p className="text-xs text-gray-500 mt-2">
+                        Click to review suggested reply.
+                    </p>
+                )}
+              </li>
+            </Link>
+          ))}
+        </ul>
+      </section>
+    </div>
+  );
+}
+
+--- END OF /home/rick110/RickDrive/email_automation/frontend/app/emails/page.tsx ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/app/emails/[id]/page.tsx ---
+
+// /home/rick110/RickDrive/email_automation/frontend/app/emails/[id]/page.tsx
+
+"use client";
+
+import { useSession } from "next-auth/react";
+import { useEffect, useState, useCallback } from "react";
+import { useRouter, useParams } from "next/navigation";
+import DOMPurify from 'dompurify'; // For sanitizing HTML content
+import Link from "next/link";
+
+// Define the Email interface (should match the one in emails/page.tsx)
+interface Email {
+  id: string;
+  from: string; // Changed from 'from_address' in DB to 'from' for frontend display
+  subject: string;
+  snippet: string;
+  sentiment: string;
+  reply_status: string;
+  suggested_reply_body?: string;
+  full_body?: string; // The full HTML/plain text body of the email
+}
+
+export default function EmailDetailPage() {
+  const { data: session, status } = useSession();
+  const router = useRouter();
+  const params = useParams(); // Get dynamic route parameters
+  const emailId = params.id as string; // The email ID from the URL
+
+  const [email, setEmail] = useState<Email | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [replyStatusMessage, setReplyStatusMessage] = useState<string | null>(null);
+
+  // Helper function to fetch a single email by ID
+  const fetchEmailDetails = useCallback(async () => {
+    if (!session?.accessToken || !emailId) {
+      setLoading(false);
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    try {
+      // Fetch specific email from the backend, asking it to fetch fresh data if needed
+      const res = await fetch(`http://localhost:8000/api/read-emails?email_id=${emailId}&fetch_new=true`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          access_token: session.accessToken,
+          refresh_token: session.refreshToken,
+          user_email: session.user?.email,
+        }),
+      });
+
+      if (!res.ok) {
+        const errData = await res.json();
+        throw new Error(errData.detail || `HTTP error! Status: ${res.status}`);
+      }
+
+      const data = await res.json();
+      // The backend now returns a single email object for email_id queries
+      setEmail(data.email || null);
+
+      // Immediately mark the email as read after fetching its details
+      await markEmailAsRead(emailId, session.accessToken);
+
+    } catch (err: any) {
+      setError(`Failed to load email details: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [session, emailId]);
+
+  // Function to mark an email as read in the backend/DB
+  const markEmailAsRead = useCallback(async (id: string, accessToken: string) => {
+    try {
+      const res = await fetch("http://localhost:8000/api/mark-email-read", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email_id: id, access_token: accessToken }),
+      });
+      if (!res.ok) {
+        const errData = await res.json();
+        console.error("Failed to mark email as read:", errData.detail);
+      } else {
+        console.log(`Email ${id} marked as read.`);
+      }
+    } catch (err) {
+      console.error("Error marking email as read:", err);
+    }
+  }, []);
+
+  // Function to send the suggested reply
+  const sendSuggestedReply = async () => {
+    // Extract recipient first and validate it
+    const rawFrom = email?.from || ""; // Ensure it's always a string, even if null/undefined
+    const recipient = rawFrom.match(/<(.*?)>/)?.[1] || rawFrom.trim(); // Extract email, or use full string, trim whitespace
+
+    // Validate all required data before attempting to send
+    if (!session?.accessToken || !email?.suggested_reply_body || !recipient || !email?.subject) {
+      let missingFields = [];
+      if (!session?.accessToken) missingFields.push("Access Token");
+      if (!email?.suggested_reply_body) missingFields.push("Suggested Reply Body");
+      if (!recipient) missingFields.push("Recipient Email (From field)"); // More specific error
+      if (!email?.subject) missingFields.push("Subject");
+
+      setReplyStatusMessage(`Error: Missing data to send reply: ${missingFields.join(', ')}. Please ensure the email has a valid sender and a suggested reply.`);
+      return;
+    }
+
+    setReplyStatusMessage("Sending suggested reply...");
+    try {
+      const subject = `Re: ${email.subject}`; // Prefix subject with Re:
+
+      const res = await fetch("http://localhost:8000/api/send-manual-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          access_token: session.accessToken,
+          to: recipient, // Use the derived recipient
+          subject: subject,
+          body: email.suggested_reply_body,
+          original_message_id: email.id, // Pass original ID to mark as replied
+        }),
+      });
+
+      const data = await res.json();
+      if (res.ok && data.success) {
+        setReplyStatusMessage("Suggested reply sent successfully!");
+        // Update the reply status locally and in DB
+        if (email) {
+            setEmail(prev => prev ? { ...prev, reply_status: "User Replied" } : null);
+            // Mark as replied in DB
+            await updateEmailStatusInDB(email.id, 'User Replied');
+        }
+      } else {
+        setReplyStatusMessage(`Error sending reply: ${data.detail || data.error || 'Unknown error'}`);
+      }
+    } catch (err: any) {
+      setReplyStatusMessage(`Error sending reply: ${err.message}`);
+    }
+  };
+
+  // Helper to update email status in DB (e.g., after sending reply)
+  const updateEmailStatusInDB = async (emailId: string, newReplyStatus: string) => {
+    try {
+      const res = await fetch("http://localhost:8000/api/update-email-status", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email_id: emailId,
+          reply_status: newReplyStatus,
+          is_replied: true // Always mark as replied if reply status changes
+        }),
+      });
+      if (!res.ok) {
+        const errData = await res.json();
+        console.error("Failed to update email status in DB:", errData.detail);
+      } else {
+        console.log(`Email ${emailId} status updated to ${newReplyStatus}.`);
+      }
+    } catch (err) {
+      console.error("Error updating email status in DB:", err);
+    }
+  };
+
+
+  useEffect(() => {
+    if (status === "loading") return;
+
+    if (status === "unauthenticated") {
+      router.push('/api/auth/signin');
+      return;
+    }
+
+    if (status === "authenticated" && emailId) {
+      fetchEmailDetails();
+    }
+  }, [status, router, emailId, fetchEmailDetails]);
+
+  // Helper function to determine badge color based on sentiment
+  const getSentimentClass = (sentiment: string) => {
+    switch (sentiment.toUpperCase()) {
+      case 'POSITIVE':
+        return 'bg-green-100 text-green-800';
+      case 'NEGATIVE':
+        return 'bg-red-100 text-red-800';
+      case 'NEUTRAL':
+        return 'bg-gray-100 text-gray-800';
+      case 'N/A':
+        return 'bg-blue-100 text-blue-800';
+      default:
+        return 'bg-yellow-100 text-yellow-800';
+    }
+  };
+
+  // Determine if the reply button should be disabled
+  // This derivation needs to safely handle email or email.from being null/undefined
+  const canSendReply = email?.suggested_reply_body &&
+                       email.reply_status === "Pending User Review" &&
+                       // Safely get the "from" string, default to empty if null/undefined
+                       !!((email?.from || "").match(/<(.*?)>/)?.[1] || (email?.from || "").trim()); // Check if a valid recipient can be derived
+
+  if (loading) {
+    return <div className="p-6">Loading email details...</div>;
+  }
+
+  if (error) {
+    return <div className="p-6 text-red-600">Error: {error}</div>;
+  }
+
+  if (!email) {
+    return <div className="p-6 text-gray-600">Email not found.</div>;
+  }
+
+  // Sanitize full_body for display
+  const sanitizedFullBody = DOMPurify.sanitize(email.full_body || email.snippet);
+
+  return (
+    <div className="p-6 font-sans bg-gray-50 min-h-screen">
+      <Link href="/emails" className="text-blue-600 hover:underline mb-4 block">
+        &larr; Back to Inbox
+      </Link>
+      <h1 className="text-3xl font-bold mb-6 text-gray-900">Email Details</h1>
+
+      <div className="bg-white p-6 rounded-lg shadow-md mb-6 border border-gray-200">
+        <div className="flex justify-between items-start mb-4">
+          <div>
+            <p className="text-gray-600 text-sm">From:</p>
+            <p className="font-semibold text-lg text-gray-800">{email.from || "N/A (Sender Missing)"}</p> {/* Display N/A if from is empty */}
+          </div>
+          <span className={`text-sm font-medium px-3 py-1 rounded-full ${getSentimentClass(email.sentiment)}`}>
+            {email.sentiment}
+          </span>
+        </div>
+        <p className="text-gray-600 text-sm">Subject:</p>
+        <h2 className="2xl font-bold mb-4 text-gray-900">{email.subject}</h2>
+
+        <div className="border-t border-b border-gray-200 py-4 mb-4">
+          <p className="text-gray-600 text-sm mb-2">Message:</p>
+          {/* Render full_body if available, otherwise snippet */}
+          <div
+            className="prose prose-sm max-w-none text-gray-700 leading-relaxed"
+            dangerouslySetInnerHTML={{ __html: sanitizedFullBody }} // Use dangerouslySetInnerHTML with DOMPurify
+          />
+        </div>
+
+        <p className="text-sm font-medium text-blue-700">Status: {email.reply_status}</p>
+
+        {email.suggested_reply_body && (
+          <div className="mt-6 p-4 border border-blue-300 bg-blue-50 rounded-md">
+            <h3 className="text-xl font-semibold mb-3 text-blue-800">Suggested Reply:</h3>
+            <div className="bg-blue-100 p-3 rounded-md text-blue-900 text-sm italic">
+              <p>{email.suggested_reply_body}</p>
+            </div>
+            {/* Display message if cannot send reply */}
+            {!canSendReply && (
+                <p className="mt-2 text-red-600 text-sm">
+                    Cannot send reply: Either a suggested reply is missing, or the sender's email address is invalid/missing, or this email has already been replied to.
+                </p>
+            )}
+            <button
+              onClick={sendSuggestedReply}
+              className="mt-4 bg-green-600 text-white px-5 py-2 rounded-md hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-green-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              disabled={!canSendReply || replyStatusMessage?.startsWith("Sending...")} // Use the canSendReply helper
+            >
+              Send Suggested Reply
+            </button>
+            {replyStatusMessage && <p className="mt-2 text-sm text-gray-600">{replyStatusMessage}</p>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+--- END OF /home/rick110/RickDrive/email_automation/frontend/app/emails/[id]/page.tsx ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/components/AuthProviders.tsx ---
+
+"use client"; // <--- VERY IMPORTANT: This makes it a Client Component
+
+import { SessionProvider } from "next-auth/react";
+import { ReactNode } from "react";
+
+interface AuthProvidersProps {
+  children: ReactNode;
+}
+
+export default function AuthProviders({ children }: AuthProvidersProps) {
+  return <SessionProvider>{children}</SessionProvider>;
+}
+--- END OF /home/rick110/RickDrive/email_automation/frontend/components/AuthProviders.tsx ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/components/AuthUI.tsx ---
+
+// components/AuthUI.tsx
+"use client";
+
+import { useSession, signIn, signOut } from "next-auth/react";
+
+export default function AuthUI() {
+  const { data: session } = useSession();
+
+  if (!session) {
+    return <button onClick={() => signIn("google")}>Login with Google</button>;
+  }
+
+  return (
+    <div>
+      <p>Welcome, {session.user?.email}</p>
+      <button onClick={() => signOut()}>Logout</button>
+    </div>
+  );
+}
+
+--- END OF /home/rick110/RickDrive/email_automation/frontend/components/AuthUI.tsx ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/components/SendTokenToBackend.tsx ---
+
+// File: frontend/components/SendTokenToBackend.tsx
+"use client";
+
+import { useSession } from "next-auth/react";
+import { useEffect } from "react";
+
+export default function SendTokenToBackend() {
+  const { data: session, status } = useSession(); // ✅ ADDED: status
+
+  useEffect(() => {
+    // ✅ IMPROVED: Check for authenticated status
+    if (status === "authenticated" && session?.accessToken) {
+      console.log("Attempting to send token to backend...");
+      fetch("http://localhost:8000/api/store-token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          access_token: session.accessToken,
+          // ✅ ADDED: Sending refresh_token and user_email
+          refresh_token: session.refreshToken,
+          user_email: session.user?.email,
+        }),
+      })
+        .then((res) => {
+          if (!res.ok) {
+            return res.text().then(text => { throw new Error(`HTTP error! status: ${res.status}, body: ${text}`); });
+          }
+          return res.json();
+        })
+        .then((data) => console.log("✅ Token sent to backend:", data))
+        .catch((err) => console.error("❌ Error sending token:", err));
+    } else if (status === "unauthenticated") {
+        console.log("User is unauthenticated, not sending token to backend.");
+    } else if (status === "loading") {
+        console.log("Session is loading, waiting to send token to backend.");
+    }
+  }, [session, status]); // ✅ ADDED: status to dependency array
+
+  return <p>Token has been sent to the backend (check console).</p>;
+}
+--- END OF /home/rick110/RickDrive/email_automation/frontend/components/SendTokenToBackend.tsx ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/components/SendEmailForm.tsx ---
+
+"use client";
+import { useSession } from "next-auth/react";
+import { useState } from "react";
+
+export default function SendEmailForm() {
+  const { data: session } = useSession();
+  const [form, setForm] = useState({ to: "", subject: "", body: "" });
+  const [status, setStatus] = useState("");
+
+  const sendEmail = async () => {
+    if (!session?.accessToken) {
+      setStatus("Error: Not authenticated. Please log in.");
+      return;
+    }
+
+    setStatus("Sending...");
+    // --- UPDATED ENDPOINT HERE ---
+    const res = await fetch("http://localhost:8000/api/send-manual-email", { // Changed from /send-email
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        access_token: session.accessToken,
+        to: form.to,
+        subject: form.subject,
+        body: form.body,
+      }),
+    });
+
+    const data = await res.json();
+    if (res.ok && data.success) { // Check res.ok for proper HTTP success
+      setStatus("Email sent!");
+      setForm({ to: "", subject: "", body: "" }); // Clear form on success
+    } else {
+      setStatus(`Error: ${data.detail || data.error || 'Unknown error'}`); // More specific error message
+    }
+  };
+
+  return (
+    <div className="max-w-md space-y-4">
+      <input
+        type="email"
+        placeholder="Recipient"
+        value={form.to}
+        onChange={(e) => setForm({ ...form, to: e.target.value })}
+        className="w-full p-2 border rounded-md focus:ring-blue-500 focus:border-blue-500"
+      />
+      <input
+        type="text"
+        placeholder="Subject"
+        value={form.subject}
+        onChange={(e) => setForm({ ...form, subject: e.target.value })}
+        className="w-full p-2 border rounded-md focus:ring-blue-500 focus:border-blue-500"
+      />
+      <textarea
+        placeholder="Message"
+        value={form.body}
+        onChange={(e) => setForm({ ...form, body: e.target.value })}
+        className="w-full p-2 border rounded-md focus:ring-blue-500 focus:border-blue-500 min-h-[120px]"
+      />
+      <button
+        onClick={sendEmail}
+        className="bg-blue-500 text-white px-4 py-2 rounded-md hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed"
+        disabled={!form.to || !form.subject || !form.body || status === "Sending..."}
+      >
+        Send Email
+      </button>
+      <p className="text-sm text-gray-600">{status}</p>
+    </div>
+  );
+}
+--- END OF /home/rick110/RickDrive/email_automation/frontend/components/SendEmailForm.tsx ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/lib/utils.ts ---
+
+import { clsx, type ClassValue } from "clsx"
+import { twMerge } from "tailwind-merge"
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs))
+}
+
+--- END OF /home/rick110/RickDrive/email_automation/frontend/lib/utils.ts ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/types/next-auth.d.ts ---
+
+// /home/rick110/RickDrive/email_automation/frontend/types/next-auth.d.ts or wherever you keep it
+
+import NextAuth, { DefaultSession, DefaultUser } from "next-auth";
+import { JWT } from "next-auth/jwt";
+
+declare module "next-auth" {
+  /**
+   * Returned by `useSession`, `getSession` and received as a prop on the `SessionProvider` React Context
+   */
+  interface Session {
+    accessToken?: string;
+    refreshToken?: string;
+    error?: "RefreshAccessTokenError";
+    user?: {
+      email?: string | null;
+      name?: string | null;
+      image?: string | null;
+    } & DefaultSession["user"]; // Merge with default user properties
+  }
+
+  interface User extends DefaultUser {
+    // Add custom properties to User if needed
+  }
+}
+
+declare module "next-auth/jwt" {
+  /**
+   * Returned by the `jwt` callback and `getToken`, when using JWT sessions
+   */
+  interface JWT {
+    accessToken?: string;
+    refreshToken?: string;
+    accessTokenExpires?: number;
+    user?: DefaultUser;
+    error?: "RefreshAccessTokenError";
+  }
+}
+--- END OF /home/rick110/RickDrive/email_automation/frontend/types/next-auth.d.ts ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/backend/main.py ---
+
+# /home/rick110/RickDrive/email_automation/backend/main.py
+
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+import groq
+from database import get_emails_from_db, insert_email, update_email_status, create_email_table
+from gmail_reader import get_gmail_messages, send_email
+
+# --- Groq Client Initialization ---
+API_KEY = "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"
+
+try:
+    if not API_KEY or API_KEY == "YOUR_GROQ_API_KEY_HERE":
+        print("🔴 FATAL: Groq API key is not set in the code. Please replace 'YOUR_GROQ_API_KEY_HERE'.")
+        client = None
+    else:
+        client = groq.Client(api_key=API_KEY)
+except Exception as e:
+    print(f"🔴 FATAL: Failed to initialize Groq client. Error: {e}")
+    client = None
+
+app = FastAPI()
+
+# --- CORS Middleware ---
+origins = [
+    "http://localhost:3000",
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def startup_event():
+    create_email_table()
+    print("✅ Database table ensured to exist.")
+
+
+# --- Pydantic Models ---
+class TokenPayload(BaseModel):
+    access_token: str
+    refresh_token: str | None = None
+    user_email: str | None = None
+
+class SendEmailPayload(BaseModel):
+    access_token: str
+    to: str
+    subject: str
+    body: str
+    original_message_id: str | None = None
+
+class MarkEmailReadPayload(BaseModel):
+    email_id: str
+    access_token: str
+
+class UpdateEmailStatusPayload(BaseModel):
+    email_id: str
+    is_read: bool | None = None
+    is_replied: bool | None = None
+    reply_status: str | None = None
+
+
+# --- API Endpoints ---
+@app.get("/")
+async def read_root():
+    return {"message": "FastAPI Backend is running!"}
+
+@app.post("/api/store-token")
+async def store_token(payload: TokenPayload):
+    print(f"Received token for {payload.user_email}.")
+    return {"message": "Token received successfully on backend!", "email": payload.user_email}
+
+@app.post("/api/read-emails")
+async def read_emails_and_process(
+    payload: TokenPayload,
+    email_id: str | None = Query(None, description="Optional email ID to fetch a specific email"),
+    fetch_new: bool = Query(True, description="Whether to fetch new emails from Gmail or rely on database only"),
+    limit: int = Query(10, description="Maximum number of emails to return")
+):
+    print(f"Processing /api/read-emails request. Email ID: {email_id}, Fetch New: {fetch_new}, Limit: {limit}")
+
+    if not payload.access_token:
+        raise HTTPException(status_code=400, detail="Access token is missing.")
+    if not client:
+        raise HTTPException(status_code=500, detail="Groq client is not configured on the server. Check the API key.")
+
+    retrieved_emails_from_gmail = []
+    # If fetch_new is True, or if a specific email_id is requested AND fetch_new is True,
+    # attempt to fetch from Gmail.
+    # The 'email_id' part ensures that even if you're on a detail page and want to refresh that specific email,
+    # it can hit Gmail.
+    if fetch_new or email_id: # ✅ Adjusted condition: fetch new if explicitly requested or if fetching a specific ID
+        try:
+            # Query for unread messages when listing.
+            # When fetching by ID, we don't need a search query, just the ID.
+            gmail_query = "is:unread" if not email_id else None # Only apply query if not fetching specific ID
+
+            # The max_results for initial list (when email_id is None) is set to 20 per your request
+            emails_from_gmail = get_gmail_messages(
+                payload.access_token,
+                max_results=20, # Keep fetching max 20 unread for initial sync
+                email_id=email_id,
+                query=gmail_query
+            )
+            retrieved_emails_from_gmail = emails_from_gmail
+
+            # Store/update fetched emails in the database
+            for email_data in emails_from_gmail:
+                # Initialize default sentiment/reply_status for new emails from Gmail
+                email_data['sentiment'] = email_data.get('sentiment', 'N/A')
+                email_data['reply_status'] = email_data.get('reply_status', 'Not Replied')
+                email_data['is_read'] = 0 # Mark as unread initially
+                email_data['is_replied'] = 0 # Mark as unreplied initially
+                insert_email(email_data) # Insert or update
+
+        except Exception as e:
+            print(f"❌ Error fetching emails from Gmail: {e}")
+            # Do not raise HTTPException here, allow proceeding with DB emails
+            # This allows the app to function even if Gmail API calls fail temporarily
+    
+    # --- Logic for handling email processing (sentiment, reply suggestion) ---
+    # If a specific email_id is requested, fetch and process only that one from DB
+    if email_id:
+        db_emails = get_emails_from_db(email_id=email_id)
+        if not db_emails:
+            # If specific email not found in DB even after trying Gmail fetch, raise 404
+            raise HTTPException(status_code=404, detail=f"Email with ID '{email_id}' not found in database.")
+        
+        email_to_process = db_emails[0]
+        
+        # Only process with Groq if sentiment is N/A or if it was newly fetched from Gmail
+        # This prevents re-processing already categorized emails every time
+        is_new_or_unprocessed = email_to_process.get('sentiment') == 'N/A' or \
+                                 email_to_process.get('reply_status') == 'Not Replied' or \
+                                 any(e['id'] == email_to_process['id'] for e in retrieved_emails_from_gmail)
+
+        if is_new_or_unprocessed:
+            try:
+                sentiment_completion = client.chat.completions.create(
+                    messages=[
+                        {"role": "system", "content": "Analyze the sentiment of the following email. Respond with only one word: POSITIVE, NEGATIVE, or NEUTRAL."},
+                        {"role": "user", "content": f"From: {email_to_process['from_address']}\nSubject: {email_to_process['subject']}\nSnippet: {email_to_process['snippet']}"}
+                    ],
+                    model="llama3-8b-8192",
+                    temperature=0.1
+                )
+                sentiment = sentiment_completion.choices[0].message.content.strip().upper()
+                email_to_process['sentiment'] = sentiment
+
+                if sentiment == "NEGATIVE":
+                    print(f"Negative sentiment detected for email from {email_to_process['from_address']}. Generating reply suggestion...")
+                    reply_completion = client.chat.completions.create(
+                        messages=[
+                            {"role": "system", "content": "You are a helpful assistant. Draft a polite, professional, and empathetic email reply. Acknowledge the user's concerns based on their message and assure them you will investigate the issue promptly. Keep it concise."},
+                            {"role": "user", "content": f"Based on this email, draft a reply:\n\nFrom: {email_to_process['from_address']}\nSubject: {email_to_process['subject']}\nSnippet: {email_to_process['snippet']}"}
+                        ],
+                        model="llama3-8b-8192",
+                        temperature=0.7
+                    )
+                    suggested_reply_body = reply_completion.choices[0].message.content
+                    email_to_process['suggested_reply_body'] = suggested_reply_body
+                    email_to_process['reply_status'] = "Pending User Review"
+                    print(f"Reply suggestion generated for {email_to_process['from_address']}. Status: {email_to_process['reply_status']}")
+
+                insert_email(email_to_process) # Update with new Groq results
+            except Exception as e:
+                print(f"❌ Error processing individual email (ID: {email_to_process.get('id')}): {e}")
+                email_to_process['sentiment'] = "Error"
+                email_to_process['reply_status'] = "Processing Failed"
+                email_to_process['suggested_reply_body'] = None
+                insert_email(email_to_process) # Update with error status
+        
+        # Return the single (potentially re-processed) email
+        return {"email": email_to_process}
+    
+    else: # If no specific email_id, return a list of unread/unreplied emails from DB
+        # This is the primary path for the main /emails page display
+        final_emails_to_return = get_emails_from_db(limit=limit, is_read=False, is_replied=False)
+        
+        # Ensure Groq processing for any newly fetched or unprocessed items in the list view
+        # This prevents redundant Groq calls if already processed, but catches new ones.
+        for email_db in final_emails_to_return:
+            is_newly_fetched_in_list = any(e['id'] == email_db['id'] for e in retrieved_emails_from_gmail)
+            if email_db.get('sentiment') == 'N/A' or email_db.get('reply_status') == 'Not Replied' or is_newly_fetched_in_list:
+                try:
+                    sentiment_completion = client.chat.completions.create(
+                        messages=[
+                            {"role": "system", "content": "Analyze the sentiment of the following email. Respond with only one word: POSITIVE, NEGATIVE, or NEUTRAL."},
+                            {"role": "user", "content": f"From: {email_db['from_address']}\nSubject: {email_db['subject']}\nSnippet: {email_db['snippet']}"}
+                        ],
+                        model="llama3-8b-8192",
+                        temperature=0.1
+                    )
+                    sentiment = sentiment_completion.choices[0].message.content.strip().upper()
+                    email_db['sentiment'] = sentiment
+
+                    if sentiment == "NEGATIVE":
+                        reply_completion = client.chat.completions.create(
+                            messages=[
+                                {"role": "system", "content": "You are a helpful assistant. Draft a polite, professional, and empathetic email reply. Acknowledge the user's concerns based on their message and assure them you will investigate the issue promptly. Keep it concise."},
+                                {"role": "user", "content": f"Based on this email, draft a reply:\n\nFrom: {email_db['from_address']}\nSubject: {email_db['subject']}\nSnippet: {email_db['snippet']}"}
+                            ],
+                            model="llama3-8b-8192",
+                            temperature=0.7
+                        )
+                        suggested_reply_body = reply_completion.choices[0].message.content
+                        email_db['suggested_reply_body'] = suggested_reply_body
+                        email_db['reply_status'] = "Pending User Review"
+                    
+                    insert_email(email_db) # Update with new Groq results
+                except Exception as e:
+                    print(f"❌ Error processing email in list view (ID: {email_db.get('id')}): {e}")
+                    email_db['sentiment'] = "Error"
+                    email_db['reply_status'] = "Processing Failed"
+                    email_db['suggested_reply_body'] = None
+                    insert_email(email_db) # Update with error status
+
+        # Re-fetch from DB to get the latest updated statuses (especially useful after Groq processing loop)
+        final_emails_to_return = get_emails_from_db(limit=limit, is_read=False, is_replied=False)
+
+        # Map DB column names to frontend expected names
+        formatted_emails = [
+            {
+                "id": email["id"],
+                "from": email["from_address"],
+                "subject": email["subject"],
+                "snippet": email["snippet"],
+                "sentiment": email["sentiment"],
+                "reply_status": email["reply_status"],
+                "suggested_reply_body": email["suggested_reply_body"],
+                "full_body": email["full_body"]
+            } for email in final_emails_to_return
+        ]
+
+        return {"emails": formatted_emails}
+
+
+@app.post("/api/send-manual-email")
+async def send_manual_email_route(payload: SendEmailPayload):
+    print(f"➡️ Manually sending email to {payload.to}")
+    if not all([payload.access_token, payload.to, payload.subject, payload.body]):
+        raise HTTPException(status_code=400, detail="Missing required fields for sending an email.")
+
+    try:
+        result = send_email(payload.access_token, payload.to, payload.subject, payload.body)
+        print("✅ Manual email sent. Message ID:", result.get("id"))
+
+        if payload.original_message_id:
+            update_email_status(payload.original_message_id, is_replied=True, reply_status="User Replied")
+            print(f"Marked email {payload.original_message_id} as replied in DB.")
+
+        return {"success": True, "messageId": result.get("id")}
+    except Exception as e:
+        print(f"❌ Error in /api/send-manual-email endpoint: {e}")
+        error_message = str(e)
+        if "invalid_grant" in error_message.lower():
+            raise HTTPException(status_code=401, detail="Authentication error. The token may have expired. Please sign in again.")
+        raise HTTPException(status_code=500, detail=f"Failed to send email: {error_message}")
+
+
+@app.post("/api/mark-email-read")
+async def mark_email_read(payload: MarkEmailReadPayload):
+    print(f"Attempting to mark email {payload.email_id} as read...")
+    try:
+        success = update_email_status(payload.email_id, is_read=True)
+        if success:
+            return {"success": True, "message": f"Email {payload.email_id} marked as read."}
+        else:
+            raise HTTPException(status_code=404, detail="Email not found or no update needed.")
+    except Exception as e:
+        print(f"❌ Error marking email as read: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to mark email as read: {str(e)}")
+
+@app.post("/api/update-email-status")
+async def api_update_email_status(payload: UpdateEmailStatusPayload):
+    print(f"Attempting to update status for email {payload.email_id} with is_read={payload.is_read}, is_replied={payload.is_replied}, reply_status={payload.reply_status}...")
+    try:
+        success = update_email_status(
+            payload.email_id,
+            is_read=payload.is_read,
+            is_replied=payload.is_replied,
+            reply_status=payload.reply_status
+        )
+        if success:
+            return {"success": True, "message": f"Email {payload.email_id} status updated."}
+        else:
+            raise HTTPException(status_code=404, detail="Email not found or no update needed.")
+    except Exception as e:
+        print(f"❌ Error updating email status: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update email status: {str(e)}")
+
+--- END OF /home/rick110/RickDrive/email_automation/backend/main.py ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/backend/gmail_reader.py ---
+
+import requests
+import time
+import base64
+from email.mime.text import MIMEText
+from googleapiclient.discovery import build
+from google.oauth2.credentials import Credentials
+
+def get_gmail_messages(access_token: str, max_results: int = 5, email_id: str | None = None, query: str | None = None):
+    headers = {
+        "Authorization": f"Bearer {access_token}"
+    }
+    start_time = time.time()
+    print(f"[{time.time() - start_time:.2f}s] Starting Gmail API call...")
+
+    messages_to_process = []
+
+    if email_id:
+        print(f"[{time.time() - start_time:.2f}s] Fetching specific message: {email_id}...")
+        msg_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{email_id}?format=full"
+        msg_response = requests.get(msg_url, headers=headers)
+        if msg_response.status_code == 200:
+            messages_to_process.append(msg_response.json())
+        else:
+            print(f"Error fetching specific message {email_id}:", msg_response.text)
+            return []
+    else:
+        list_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults={max_results}"
+        if query:
+            list_url += f"&q={query}"
+
+        if not query or ("in:inbox" not in query.lower() and "labelids" not in list_url.lower()):
+             list_url += "&labelIds=INBOX"
+
+        list_response = requests.get(list_url, headers=headers)
+        print(f"[{time.time() - start_time:.2f}s] List messages response: {list_response.status_code}")
+
+        if list_response.status_code != 200:
+            print("Error listing messages:", list_response.text)
+            return []
+
+        messages_to_process = list_response.json().get("messages", [])
+        if not messages_to_process:
+            print(f"[{time.time() - start_time:.2f}s] No messages found with current criteria.")
+            return []
+        print(f"[{time.time() - start_time:.2f}s] Found {len(messages_to_process)} messages. Fetching details...")
+
+
+    detailed_messages = []
+    for i, msg in enumerate(messages_to_process):
+        msg_id = msg["id"]
+        if email_id and msg_id == email_id:
+            data = msg
+        else:
+            msg_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}?format=full"
+            msg_response = requests.get(msg_url, headers=headers)
+            print(f"[{time.time() - start_time:.2f}s] Fetched message {i+1}/{len(messages_to_process)} (ID: {msg_id[:5]}...): {msg_response.status_code}")
+
+            if msg_response.status_code != 200:
+                print(f"Error fetching message {msg_id}:", msg_response.text)
+                continue
+            data = msg_response.json()
+
+        payload_headers = data.get("payload", {}).get("headers", [])
+        headers_dict = {h["name"].lower(): h["value"] for h in payload_headers}
+
+        full_body = ""
+        parts = data.get("payload", {}).get("parts", [])
+        if not parts and data.get("payload", {}).get("body", {}).get("data"):
+            try:
+                full_body = base64.urlsafe_b64decode(data["payload"]["body"]["data"]).decode("utf-8")
+            except Exception as e:
+                print(f"Error decoding simple body for {msg_id}: {e}")
+        else:
+            for part in parts:
+                mime_type = part.get("mimeType")
+                body_data = part.get("body", {}).get("data")
+                if body_data and mime_type in ["text/plain", "text/html"]:
+                    try:
+                        full_body = base64.urlsafe_b64decode(body_data).decode("utf-8")
+                        if mime_type == "text/plain":
+                            break
+                    except Exception as e:
+                        print(f"Error decoding part body for {msg_id}, type {mime_type}: {e}")
+
+        detailed_messages.append({
+            "id": msg_id,
+            "threadId": data.get("threadId"),
+            "historyId": data.get("historyId"),
+            "from": headers_dict.get("from", ""), # Ensures it defaults to empty string if header is missing
+            "subject": headers_dict.get("subject", ""),
+            "snippet": data.get("snippet", ""),
+            "internalDate": data.get("internalDate"),
+            "full_body": full_body,
+            "is_read": 0,
+            "is_replied": 0
+        })
+
+    print(f"[{time.time() - start_time:.2f}s] All messages processed. Total time.")
+    return detailed_messages
+
+
+def send_email(access_token: str, to: str, subject: str, body: str):
+    print("📤 Sending email...")
+    creds = Credentials(token=access_token)
+    service = build("gmail", "v1", credentials=creds)
+
+    message = MIMEText(body)
+    message["to"] = to
+    message["subject"] = subject
+    raw = base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+    response = service.users().messages().send(userId="me", body={"raw": raw}).execute()
+    print("✅ Email sent. Message ID:", response.get("id"))
+    return response
+
+--- END OF /home/rick110/RickDrive/email_automation/backend/gmail_reader.py ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/backend/database.py ---
+
+# /home/rick110/RickDrive/email_automation/backend/database.py
+
+import sqlite3
+from typing import List, Dict, Optional
+
+DATABASE_URL = "emails.db" # This will create a file in your backend directory
+
+def get_db_connection():
+    conn = sqlite3.connect(DATABASE_URL)
+    conn.row_factory = sqlite3.Row # This allows access to columns by name
+    return conn
+
+def create_email_table():
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS emails (
+            id TEXT PRIMARY KEY,
+            threadId TEXT,
+            historyId TEXT,
+            from_address TEXT NOT NULL,
+            subject TEXT,
+            snippet TEXT,
+            internalDate INTEGER,
+            sentiment TEXT,
+            reply_status TEXT,
+            suggested_reply_body TEXT,
+            full_body TEXT, -- To store the full email body when fetched
+            is_read INTEGER DEFAULT 0, -- 0 for unread, 1 for read
+            is_replied INTEGER DEFAULT 0, -- 0 for unreplied, 1 for replied
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+def insert_email(email_data: Dict):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    # Check if email already exists
+    cursor.execute("SELECT id FROM emails WHERE id = ?", (email_data['id'],))
+    existing_email = cursor.fetchone()
+
+    if existing_email:
+        print(f"Email with ID {email_data['id']} already exists. Updating...")
+        # Update existing email (e.g., snippet, sentiment, reply status, full_body)
+        cursor.execute("""
+            UPDATE emails
+            SET from_address = ?, subject = ?, snippet = ?, sentiment = ?,
+                reply_status = ?, suggested_reply_body = ?, full_body = ?,
+                is_read = ?, is_replied = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (
+            email_data.get('from', ''),
+            email_data.get('subject', ''),
+            email_data.get('snippet', ''),
+            email_data.get('sentiment', 'N/A'),
+            email_data.get('reply_status', 'Not Replied'),
+            email_data.get('suggested_reply_body'),
+            email_data.get('full_body'),
+            int(email_data.get('is_read', 0)),
+            int(email_data.get('is_replied', 0)),
+            email_data['id']
+        ))
+    else:
+        print(f"Inserting new email with ID {email_data['id']}...")
+        cursor.execute("""
+            INSERT INTO emails (id, threadId, historyId, from_address, subject, snippet, internalDate,
+                                sentiment, reply_status, suggested_reply_body, full_body, is_read, is_replied)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            email_data['id'],
+            email_data.get('threadId'),
+            email_data.get('historyId'),
+            email_data.get('from', ''),
+            email_data.get('subject', ''),
+            email_data.get('snippet', ''),
+            email_data.get('internalDate'),
+            email_data.get('sentiment', 'N/A'),
+            email_data.get('reply_status', 'Not Replied'),
+            email_data.get('suggested_reply_body'),
+            email_data.get('full_body'),
+            int(email_data.get('is_read', 0)),
+            int(email_data.get('is_replied', 0))
+        ))
+    conn.commit()
+    conn.close()
+
+def get_emails_from_db(
+    limit: int = 10,
+    offset: int = 0,
+    sentiment: Optional[str] = None,
+    reply_status: Optional[str] = None,
+    is_read: Optional[bool] = None,
+    is_replied: Optional[bool] = None,
+    email_id: Optional[str] = None # Added for fetching single email
+) -> List[Dict]:
+    conn = get_db_connection()
+    cursor = conn.cursor()
+
+    query = "SELECT * FROM emails WHERE 1=1"
+    params = []
+
+    if email_id:
+        query += " AND id = ?"
+        params.append(email_id)
+
+    if sentiment:
+        query += " AND sentiment = ?"
+        params.append(sentiment.upper())
+    if reply_status:
+        query += " AND reply_status = ?"
+        params.append(reply_status)
+    if is_read is not None:
+        query += " AND is_read = ?"
+        params.append(1 if is_read else 0)
+    if is_replied is not None:
+        query += " AND is_replied = ?"
+        params.append(1 if is_replied else 0)
+
+    query += " ORDER BY internalDate DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+
+    cursor.execute(query, params)
+    emails = cursor.fetchall()
+    conn.close()
+    return [dict(email) for email in emails]
+
+def update_email_status(email_id: str, is_read: Optional[bool] = None, is_replied: Optional[bool] = None, reply_status: Optional[str] = None): # ✅ ADDED reply_status
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    update_fields = []
+    params = []
+
+    if is_read is not None:
+        update_fields.append("is_read = ?")
+        params.append(1 if is_read else 0)
+    if is_replied is not None:
+        update_fields.append("is_replied = ?")
+        params.append(1 if is_replied else 0)
+    if reply_status is not None: # ✅ ADDED logic for reply_status
+        update_fields.append("reply_status = ?")
+        params.append(reply_status)
+
+    if not update_fields:
+        conn.close()
+        return False # Nothing to update
+
+    query = f"UPDATE emails SET {', '.join(update_fields)}, updated_at = CURRENT_TIMESTAMP WHERE id = ?"
+    params.append(email_id)
+
+    cursor.execute(query, params)
+    conn.commit()
+    rows_affected = cursor.rowcount
+    conn.close()
+    return rows_affected > 0
+
+# Initialize the database table when this module is imported
+create_email_table()
+--- END OF /home/rick110/RickDrive/email_automation/backend/database.py ---
+
