@@ -2,7 +2,6 @@
 import { useSession } from "next-auth/react";
 import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
-import SendEmailForm from "@/components/SendEmailForm";
 import Link from "next/link";
 
 // Updated Email Interface for this list page
@@ -85,10 +84,7 @@ export default function EmailPage() {
     <div className="p-6 font-sans">
       <h1 className="text-3xl font-bold mb-6">📨 Email Dashboard</h1>
 
-      <section className="mb-10 p-4 border rounded-lg bg-white shadow-sm">
-        <h2 className="text-xl font-semibold mb-3">Send New Email</h2>
-        <SendEmailForm />
-      </section>
+      {/* The Send Email Form section has been removed */}
 
       <section>
         <div className="flex justify-between items-center mb-4">
