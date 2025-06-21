@@ -1,0 +1,771 @@
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/app/api/auth/[...nextauth]/route.ts ---
+
+// /home/rick110/RickDrive/email_automation/frontend/app/api/auth/[...nextauth]/route.ts
+
+import NextAuth from "next-auth";
+import GoogleProvider from "next-auth/providers/google";
+
+// Helper function to refresh the Google access token
+async function refreshAccessToken(token: any) {
+  try {
+    const url =
+      "https://oauth2.googleapis.com/token?" +
+      new URLSearchParams({
+        client_id: process.env.GOOGLE_CLIENT_ID!,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET!,
+        grant_type: "refresh_token",
+        refresh_token: token.refreshToken,
+      });
+
+    const response = await fetch(url, {
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      method: "POST",
+    });
+
+    const refreshedTokens = await response.json();
+
+    if (!response.ok) {
+      throw refreshedTokens;
+    }
+
+    return {
+      ...token,
+      accessToken: refreshedTokens.access_token,
+      accessTokenExpires: Date.now() + refreshedTokens.expires_in * 1000, // in milliseconds
+      refreshToken: refreshedTokens.refresh_token ?? token.refreshToken, // Fall back to old refresh token
+    };
+  } catch (error) {
+    console.error("Error refreshing access token", error);
+    return { ...token, error: "RefreshAccessTokenError" };
+  }
+}
+
+const handler = NextAuth({
+  providers: [
+    GoogleProvider({
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+      authorization: {
+        params: {
+          // Request access to Gmail API scopes. Add more as needed.
+          scope: 'https://www.googleapis.com/auth/userinfo.email https://www.googleapis.com/auth/userinfo.profile https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send',
+          access_type: "offline", // This is crucial for getting a refresh token
+          prompt: "consent", // This ensures the user is prompted for consent, which helps in getting a refresh token initially
+        },
+      },
+    }),
+  ],
+  callbacks: {
+    async jwt({ token, user, account }) {
+      // Initial sign in
+      if (account && user) {
+        return {
+          accessToken: account.access_token,
+          refreshToken: account.refresh_token,
+          accessTokenExpires: account.expires_at ? account.expires_at * 1000 : undefined, // Convert to milliseconds
+          user,
+        };
+      }
+
+      // Return previous token if the access token has not expired yet
+      if (token.accessTokenExpires && Date.now() < token.accessTokenExpires) {
+        return token;
+      }
+
+      // Access token has expired, try to update it
+      return refreshAccessToken(token);
+    },
+    async session({ session, token }) {
+      // Send properties to the client, such as an access_token from a provider.
+      session.accessToken = token.accessToken;
+      session.refreshToken = token.refreshToken; // Also expose refreshToken if you need it on the client
+      session.user = token.user; // Expose the user object
+      session.error = token.error; // Propagate any refresh errors
+      return session;
+    },
+  },
+  // You might want to add debug: true for development to see more logs
+  debug: process.env.NODE_ENV === 'development',
+});
+
+export { handler as GET, handler as POST };
+--- END OF /home/rick110/RickDrive/email_automation/frontend/app/api/auth/[...nextauth]/route.ts ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/app/emails/page.tsx ---
+
+"use client";
+import { useSession } from "next-auth/react";
+import { useEffect, useState, useCallback } from "react";
+import { useRouter } from "next/navigation";
+import Link from "next/link";
+
+// Updated Email Interface for this list page
+// Removed sentiment and suggested_reply_body as they are not used/provided here
+interface Email {
+  id: string;
+  from: string;
+  subject: string;
+  snippet: string;
+  reply_status: string;
+  // full_body is not displayed on this list page, so it's optional but good to acknowledge
+  full_body?: string;
+}
+
+export default function EmailPage() {
+  const { data: session, status } = useSession();
+  const [emails, setEmails] = useState<Email[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const router = useRouter();
+
+  const fetchEmails = useCallback(async (fetchNew: boolean = false) => {
+    // Only proceed if session is authenticated
+    if (status === "loading" || !session?.accessToken || !session.user?.email) {
+      // Don't set error immediately, let useEffect handle redirection
+      if (status === "unauthenticated") {
+        router.push('/api/auth/signin');
+      }
+      return;
+    }
+
+    setLoading(true);
+    setError(null);
+    
+    try {
+      const res = await fetch(
+        `http://localhost:8000/api/read-emails?fetch_new=${fetchNew}&limit=20`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            access_token: session.accessToken,
+            // refresh_token is not needed for this specific endpoint on the backend
+            user_email: session.user.email,
+          }),
+        }
+      );
+
+      if (!res.ok) {
+        const errData = await res.json();
+        // Handle authentication errors specifically
+        if (res.status === 401) {
+          setError("Session expired. Please sign in again.");
+          router.push('/api/auth/signin'); // Redirect to sign-in on auth failure
+          return;
+        }
+        throw new Error(errData.detail || `HTTP error! Status: ${res.status}`);
+      }
+
+      const data = await res.json();
+      // Ensure data.emails is an array before setting state
+      setEmails(Array.isArray(data.emails) ? data.emails : []);
+    } catch (err: any) {
+      setError(`Failed to fetch emails: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  }, [session, status, router]); // Added status and router to dependencies for useCallback
+
+
+  useEffect(() => {
+    if (status === "unauthenticated") {
+      router.push('/api/auth/signin');
+    } else if (status === "authenticated") {
+      fetchEmails(false); // Fetch initially without 'fetch_new'
+    }
+  }, [status, router, fetchEmails]); // Ensure useEffect dependencies are complete
+
+  return (
+    <div className="p-6 font-sans">
+      <h1 className="text-3xl font-bold mb-6">📨 Email Dashboard</h1>
+
+      {/* The Send Email Form section has been removed */}
+
+      <section>
+        <div className="flex justify-between items-center mb-4">
+          <h2 className="text-2xl font-semibold">Inbox</h2>
+          <button
+            onClick={() => fetchEmails(true)}
+            className="bg-blue-600 text-white px-4 py-2 rounded-md hover:bg-blue-700 disabled:opacity-50"
+            disabled={loading} // Disable if loading
+          >
+            {loading ? "Refreshing..." : "Refresh Emails"}
+          </button>
+        </div>
+
+        {error && <p className="text-red-600 mb-4 font-medium">Error: {error}</p>}
+        
+        {!loading && emails.length === 0 && (
+          <p className="text-gray-500">No emails found in your inbox, or you haven't granted permissions.</p>
+        )}
+
+        <ul className="space-y-3">
+          {emails.map((email) => (
+            // Using Link component for client-side navigation
+            <Link key={email.id} href={`/emails/${email.id}`} passHref>
+              <li className="block p-4 border rounded-lg bg-white hover:bg-gray-50 cursor-pointer transition-colors duration-200">
+                <p className="font-semibold text-gray-800">{email.from}</p>
+                <p className="font-medium text-gray-900">{email.subject}</p>
+                <p className="text-sm text-gray-600 mt-1 truncate">
+                  {email.snippet}
+                </p>
+                <p className="text-xs text-blue-600 mt-2">
+                  Status: <span className="font-medium">{email.reply_status}</span>
+                </p>
+              </li>
+            </Link>
+          ))}
+        </ul>
+      </section>
+    </div>
+  );
+}
+--- END OF /home/rick110/RickDrive/email_automation/frontend/app/emails/page.tsx ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/app/emails/[id]/page.tsx ---
+
+// /home/rick110/RickDrive/email_automation/frontend/app/emails/[id]/page.tsx
+"use client";
+
+import { useSession } from "next-auth/react";
+import { useEffect, useState, useCallback } from "react";
+import { useParams, useRouter } from "next/navigation";
+import Link from "next/link";
+
+interface Email {
+  id: string;
+  from: string;
+  subject: string;
+  snippet: string;
+  reply_status: string;
+  full_body: string; // Ensure this is always present after fetching
+}
+
+export default function EmailDetailPage() {
+  const { data: session, status: sessionStatus } = useSession();
+  const [email, setEmail] = useState<Email | null>(null);
+  const [loading, setLoading] = useState(true); // Tracks initial email fetch loading
+  const [error, setError] = useState<string | null>(null);
+  const [sendStatus, setSendStatus] = useState<string | null>(null);
+  const [replyBody, setReplyBody] = useState("");
+  const [replySubject, setReplySubject] = useState("");
+
+  // New states for AI generation
+  const [aiPrompt, setAiPrompt] = useState(""); // User's input for AI generation context
+  const [aiGenerating, setAiGenerating] = useState(false); // Tracks AI generation loading
+  const [aiGenerationError, setAiGenerationError] = useState<string | null>(null); // Tracks AI specific errors
+
+  const router = useRouter();
+  const params = useParams();
+  const id = params.id as string;
+
+  // Fetches the details for a single email
+  const fetchEmailDetails = useCallback(async () => {
+    if (sessionStatus === "loading" || !session?.accessToken || !id) return;
+
+    setLoading(true); // Start loading for email details
+    setError(null);
+    setSendStatus(null); // Clear previous send status
+    setAiGenerationError(null); // Clear previous AI generation errors
+
+    try {
+      const res = await fetch(`http://localhost:8000/api/read-emails?email_id=${id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          access_token: session.accessToken,
+          user_email: session.user?.email,
+        }),
+      });
+
+      if (!res.ok) {
+        const errData = await res.json();
+        if (res.status === 401) {
+          router.push('/api/auth/signin');
+          return;
+        }
+        throw new Error(errData.detail || `HTTP error! Status: ${res.status}`);
+      }
+
+      const data = await res.json();
+      if (data.email) {
+        setEmail(data.email);
+        setReplySubject(`Re: ${data.email.subject || "No Subject"}`);
+        setReplyBody(""); // Clear reply body for new email view
+        setAiPrompt(""); // Clear AI prompt on new email load
+      } else {
+        throw new Error("Email data not found in the server response.");
+      }
+
+    } catch (err: any) {
+      setError(`Failed to load email details: ${err.message}`);
+    } finally {
+      setLoading(false); // Ensure main loading state is ended after fetching email details
+    }
+  }, [id, session, sessionStatus, router]);
+
+  useEffect(() => {
+    if (sessionStatus === "unauthenticated") {
+      router.push('/api/auth/signin');
+    } else if (sessionStatus === "authenticated") {
+      fetchEmailDetails();
+    }
+  }, [sessionStatus, router, fetchEmailDetails]);
+
+
+  // Handles sending the reply
+  const handleSendReply = async () => {
+    if (!email || !session?.accessToken || !replyBody.trim() || !replySubject.trim()) {
+        setSendStatus("Error: Missing information to send reply.");
+        return;
+    }
+
+    setSendStatus("Sending...");
+    try {
+        const res = await fetch("http://localhost:8000/api/send-manual-email", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                access_token: session.accessToken,
+                to: email.from,
+                subject: replySubject,
+                body: replyBody,
+                original_message_id: email.id,
+            }),
+        });
+
+        const data = await res.json();
+        if (!res.ok) {
+            if (res.status === 401) {
+              setSendStatus("❌ Error: Session expired. Please sign in again.");
+              router.push('/api/auth/signin');
+              return;
+            }
+            throw new Error(data.detail || `Failed to send email with status: ${res.status}`);
+        }
+
+        setSendStatus("✅ Reply sent successfully!");
+        setReplyBody("");
+        setReplySubject("");
+        setTimeout(() => {
+          router.push("/emails");
+        }, 1500);
+
+    } catch (err: any) {
+        setSendStatus(`❌ Error sending reply: ${err.message}`);
+    }
+};
+
+// NEW FUNCTION: Call Backend to Generate Reply with Groq
+const handleGenerateWithAI = async () => {
+    if (!email || !session?.accessToken || !session.user?.email || !aiPrompt.trim()) {
+        setAiGenerationError("Please provide a prompt for AI generation.");
+        return;
+    }
+
+    setAiGenerating(true); // Start Groq generation loading
+    setAiGenerationError(null); // Clear previous AI generation errors
+    setReplyBody("Generating AI reply..."); // Give immediate feedback in the textarea
+
+    try {
+        // Correct endpoint: /api/generate-email-body
+        const res = await fetch("http://localhost:8000/api/generate-email-body", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                access_token: session.accessToken, // For backend auth
+                user_email: session.user.email,
+                context: aiPrompt, // User's prompt for AI context
+                sender: email.from, // Original sender's email
+                subject: email.subject, // Original email subject
+            }),
+        });
+
+        const data = await res.json();
+        if (!res.ok || !data.success) {
+            if (res.status === 401) {
+              setAiGenerationError("❌ Session expired. Please sign in again.");
+              router.push('/api/auth/signin');
+              return;
+            }
+            throw new Error(data.detail || 'Failed to generate email body.');
+        }
+
+        // Set the generated body to the replyBody state
+        setReplyBody(data.generated_body);
+        setAiPrompt(""); // Clear the AI prompt after generation
+        setAiGenerationError(null); // Clear any previous AI errors
+    } catch (err: any) {
+        setAiGenerationError(`❌ AI Generation Error: ${err.message}`);
+        // Optionally, clear the "Generating AI reply..." message if an error occurred
+        if (replyBody === "Generating AI reply...") {
+            setReplyBody("");
+        }
+    } finally {
+        setAiGenerating(false); // End Groq generation loading
+    }
+};
+
+
+  // Adjust overall loading state to consider both email fetching and AI generation
+  if (loading) return <p className="p-6 text-gray-500">Loading email details...</p>;
+  if (error) return <p className="p-6 text-red-600 font-medium">Error: {error}</p>;
+  if (!email) return <p className="p-6 text-gray-500">No email data found.</p>;
+
+  return (
+    <div className="p-6 font-sans max-w-4xl mx-auto">
+        <div className="flex justify-between items-center mb-6">
+            <h1 className="text-3xl font-bold">Email Details</h1>
+            <Link href="/emails">
+                <span className="text-blue-500 hover:underline cursor-pointer">&larr; Back to Inbox</span>
+            </Link>
+        </div>
+
+      {/* Email Information Section */}
+      <section className="mb-8 p-4 border rounded-lg bg-white shadow-sm">
+        <h2 className="text-xl font-semibold mb-4 border-b pb-2">Original Message</h2>
+        <div className="space-y-2">
+            <p><strong className="font-medium text-gray-700">From:</strong> {email.from}</p>
+            <p><strong className="font-medium text-gray-700">Subject:</strong> {email.subject}</p>
+            <div className="mt-2 text-gray-800 bg-gray-50 p-3 rounded-md min-h-[100px] overflow-auto">
+                <p dangerouslySetInnerHTML={{ __html: email.full_body }}></p>
+            </div>
+            {email.snippet && email.full_body !== email.snippet && (
+              <p className="mt-2 text-gray-600 text-sm italic">Snippet: {email.snippet}</p>
+            )}
+        </div>
+      </section>
+
+      {/* AI Generate Reply Section */}
+      <section className="mb-8 p-4 border rounded-lg bg-white shadow-sm">
+        <h2 className="text-xl font-semibold mb-3">✨ Generate Reply with AI</h2>
+        <div className="space-y-4">
+            <div>
+                <label htmlFor="aiPrompt" className="block text-sm font-medium text-gray-700">
+                    What should the AI's reply be about? (e.g., "accept the invitation", "decline politely and suggest another date", "ask for more details about the project")
+                </label>
+                <textarea
+                    id="aiPrompt"
+                    value={aiPrompt}
+                    onChange={(e) => setAiPrompt(e.target.value)}
+                    className="w-full p-3 border rounded-md focus:ring-purple-500 focus:border-purple-500 min-h-[80px]"
+                    placeholder="E.g., Accept the meeting invitation."
+                    disabled={aiGenerating}
+                />
+            </div>
+            <button
+                onClick={handleGenerateWithAI}
+                className="bg-purple-600 text-white px-5 py-2 rounded-md hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-purple-500 focus:ring-offset-2 disabled:opacity-60 disabled:cursor-not-allowed"
+                disabled={!aiPrompt.trim() || aiGenerating || !email}
+            >
+                {aiGenerating ? "Generating..." : "Generate AI Reply"}
+            </button>
+            {aiGenerationError && (
+              <p className="text-red-600 text-sm font-medium mt-2">{aiGenerationError}</p>
+            )}
+        </div>
+      </section>
+
+
+      {/* Manual Reply Section */}
+      <section className="p-4 border rounded-lg bg-white shadow-sm">
+            <h2 className="text-xl font-semibold mb-3">✉️ Compose Reply</h2>
+            <p className="text-sm text-gray-500 mb-4">
+               Review the generated reply or type your own.
+            </p>
+
+            <div className="space-y-4">
+                <div>
+                  <label htmlFor="replyTo" className="block text-sm font-medium text-gray-700">To:</label>
+                  <input
+                    id="replyTo"
+                    type="text"
+                    value={email.from}
+                    readOnly
+                    className="w-full p-2 border rounded-md bg-gray-100 text-gray-600"
+                  />
+                </div>
+                <div>
+                  <label htmlFor="replySubject" className="block text-sm font-medium text-gray-700">Subject:</label>
+                  <input
+                    id="replySubject"
+                    type="text"
+                    value={replySubject}
+                    onChange={(e) => setReplySubject(e.target.value)}
+                    className="w-full p-2 border rounded-md focus:ring-blue-500 focus:border-blue-500"
+                  />
+                </div>
+                <div>
+                  <label htmlFor="replyBody" className="block text-sm font-medium text-gray-700">Body:</label>
+                  <textarea
+                      id="replyBody"
+                      value={replyBody}
+                      onChange={(e) => setReplyBody(e.target.value)}
+                      className="w-full p-3 border rounded-md focus:ring-blue-500 focus:border-blue-500 min-h-[200px]"
+                      placeholder={aiGenerating ? "Generating AI reply..." : "Type your reply here or use AI to generate one above..."}
+                      disabled={aiGenerating} // Disable while generating
+                  />
+                </div>
+                <button
+                    onClick={handleSendReply}
+                    className="bg-blue-600 text-white px-5 py-2 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-60 disabled:cursor-not-allowed"
+                    disabled={!replyBody.trim() || !replySubject.trim() || sendStatus === "Sending..." || aiGenerating}
+                >
+                    {sendStatus === "Sending..." ? "Sending..." : "Send Reply"}
+                </button>
+                {sendStatus && (
+                  <p className={`text-sm font-medium mt-2 ${sendStatus.startsWith('❌ Error') ? 'text-red-600' : 'text-green-600'}`}>
+                    {sendStatus}
+                  </p>
+                )}
+            </div>
+      </section>
+    </div>
+  );
+}
+
+--- END OF /home/rick110/RickDrive/email_automation/frontend/app/emails/[id]/page.tsx ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/components/AuthProviders.tsx ---
+
+"use client"; // <--- VERY IMPORTANT: This makes it a Client Component
+
+import { SessionProvider } from "next-auth/react";
+import { ReactNode } from "react";
+
+interface AuthProvidersProps {
+  children: ReactNode;
+}
+
+export default function AuthProviders({ children }: AuthProvidersProps) {
+  return <SessionProvider>{children}</SessionProvider>;
+}
+--- END OF /home/rick110/RickDrive/email_automation/frontend/components/AuthProviders.tsx ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/components/AuthUI.tsx ---
+
+// components/AuthUI.tsx
+"use client";
+
+import { useSession, signIn, signOut } from "next-auth/react";
+
+export default function AuthUI() {
+  const { data: session } = useSession();
+
+  if (!session) {
+    return <button onClick={() => signIn("google")}>Login with Google</button>;
+  }
+
+  return (
+    <div>
+      <p>Welcome, {session.user?.email}</p>
+      <button onClick={() => signOut()}>Logout</button>
+    </div>
+  );
+}
+
+--- END OF /home/rick110/RickDrive/email_automation/frontend/components/AuthUI.tsx ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/components/SendTokenToBackend.tsx ---
+
+// File: frontend/components/SendTokenToBackend.tsx
+"use client";
+
+import { useSession } from "next-auth/react";
+import { useEffect } from "react";
+
+export default function SendTokenToBackend() {
+  const { data: session, status } = useSession(); // ✅ ADDED: status
+
+  useEffect(() => {
+    // ✅ IMPROVED: Check for authenticated status
+    if (status === "authenticated" && session?.accessToken) {
+      console.log("Attempting to send token to backend...");
+      fetch("http://localhost:8000/api/store-token", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          access_token: session.accessToken,
+          // ✅ ADDED: Sending refresh_token and user_email
+          refresh_token: session.refreshToken,
+          user_email: session.user?.email,
+        }),
+      })
+        .then((res) => {
+          if (!res.ok) {
+            return res.text().then(text => { throw new Error(`HTTP error! status: ${res.status}, body: ${text}`); });
+          }
+          return res.json();
+        })
+        .then((data) => console.log("✅ Token sent to backend:", data))
+        .catch((err) => console.error("❌ Error sending token:", err));
+    } else if (status === "unauthenticated") {
+        console.log("User is unauthenticated, not sending token to backend.");
+    } else if (status === "loading") {
+        console.log("Session is loading, waiting to send token to backend.");
+    }
+  }, [session, status]); // ✅ ADDED: status to dependency array
+
+  return <p>Token has been sent to the backend (check console).</p>;
+}
+--- END OF /home/rick110/RickDrive/email_automation/frontend/components/SendTokenToBackend.tsx ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/components/SendEmailForm.tsx ---
+
+"use client";
+import { useSession } from "next-auth/react";
+import { useState } from "react";
+import { useRouter } from "next/navigation"; // Import useRouter
+
+export default function SendEmailForm() {
+  const { data: session } = useSession();
+  const [form, setForm] = useState({ to: "", subject: "", body: "" });
+  const [status, setStatus] = useState("");
+  const router = useRouter(); // Initialize router
+
+  const sendEmail = async () => {
+    if (!session?.accessToken) {
+      setStatus("Error: Not authenticated. Redirecting to login...");
+      router.push('/api/auth/signin'); // Redirect to login if no token
+      return;
+    }
+
+    setStatus("Sending...");
+    try {
+      const res = await fetch("http://localhost:8000/api/send-manual-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          access_token: session.accessToken,
+          to: form.to,
+          subject: form.subject,
+          body: form.body,
+        }),
+      });
+
+      const data = await res.json();
+      if (res.ok) { // Check res.ok for proper HTTP success (200-299)
+        setStatus("✅ Email sent successfully!");
+        setForm({ to: "", subject: "", body: "" }); // Clear form on success
+        // Optional: Could trigger a refresh of the main email list here if desired
+        // e.g., using a callback prop from parent or a global state management.
+      } else {
+        // Specific handling for 401 Unauthorized
+        if (res.status === 401) {
+          setStatus("❌ Error: Session expired. Please sign in again.");
+          router.push('/api/auth/signin'); // Redirect to sign-in
+        } else {
+          setStatus(`❌ Error: ${data.detail || data.error || 'Unknown error'}`); // More specific error message
+        }
+      }
+    } catch (error: any) {
+      setStatus(`❌ Network Error: ${error.message}`); // Catch network errors
+    }
+  };
+
+  return (
+    <div className="max-w-md space-y-4">
+      <input
+        type="email"
+        placeholder="Recipient"
+        value={form.to}
+        onChange={(e) => setForm({ ...form, to: e.target.value })}
+        className="w-full p-2 border rounded-md focus:ring-blue-500 focus:border-blue-500"
+        required // HTML5 validation
+      />
+      <input
+        type="text"
+        placeholder="Subject"
+        value={form.subject}
+        onChange={(e) => setForm({ ...form, subject: e.target.value })}
+        className="w-full p-2 border rounded-md focus:ring-blue-500 focus:border-blue-500"
+        required // HTML5 validation
+      />
+      <textarea
+        placeholder="Message"
+        value={form.body}
+        onChange={(e) => setForm({ ...form, body: e.target.value })}
+        className="w-full p-2 border rounded-md focus:ring-blue-500 focus:border-blue-500 min-h-[120px]"
+        required // HTML5 validation
+      />
+      <button
+        onClick={sendEmail}
+        className="bg-blue-500 text-white px-4 py-2 rounded-md hover:bg-blue-600 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 disabled:opacity-50 disabled:cursor-not-allowed"
+        // Disable if form fields are empty or sending is in progress
+        disabled={!form.to.trim() || !form.subject.trim() || !form.body.trim() || status === "Sending..."}
+      >
+        Send Email
+      </button>
+      <p className={`text-sm ${status.startsWith('✅') ? 'text-green-600' : status.startsWith('❌') ? 'text-red-600' : 'text-gray-600'}`}>
+        {status}
+      </p>
+    </div>
+  );
+}
+--- END OF /home/rick110/RickDrive/email_automation/frontend/components/SendEmailForm.tsx ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/lib/utils.ts ---
+
+import { clsx, type ClassValue } from "clsx"
+import { twMerge } from "tailwind-merge"
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs))
+}
+
+--- END OF /home/rick110/RickDrive/email_automation/frontend/lib/utils.ts ---
+
+
+--- START OF /home/rick110/RickDrive/email_automation/frontend/types/next-auth.d.ts ---
+
+// /home/rick110/RickDrive/email_automation/frontend/types/next-auth.d.ts or wherever you keep it
+
+import NextAuth, { DefaultSession, DefaultUser } from "next-auth";
+import { JWT } from "next-auth/jwt";
+
+declare module "next-auth" {
+  /**
+   * Returned by `useSession`, `getSession` and received as a prop on the `SessionProvider` React Context
+   */
+  interface Session {
+    accessToken?: string;
+    refreshToken?: string;
+    error?: "RefreshAccessTokenError";
+    user?: {
+      email?: string | null;
+      name?: string | null;
+      image?: string | null;
+    } & DefaultSession["user"]; // Merge with default user properties
+  }
+
+  interface User extends DefaultUser {
+    // Add custom properties to User if needed
+  }
+}
+
+declare module "next-auth/jwt" {
+  /**
+   * Returned by the `jwt` callback and `getToken`, when using JWT sessions
+   */
+  interface JWT {
+    accessToken?: string;
+    refreshToken?: string;
+    accessTokenExpires?: number;
+    user?: DefaultUser;
+    error?: "RefreshAccessTokenError";
+  }
+}
+--- END OF /home/rick110/RickDrive/email_automation/frontend/types/next-auth.d.ts ---
+
