@@ -3,20 +3,27 @@
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, EmailStr
 from fastapi.middleware.cors import CORSMiddleware
-import groq # Ensure this is installed: pip install groq
-import re # Needed for post-processing AI generated text
+import groq
+import time
+from typing import Optional
 
-# Import your database and Gmail reader functions
-from database import get_emails_from_db, insert_email, update_email_status, create_email_table
-from gmail_reader import get_gmail_messages, send_email
+# Import enhanced database and Gmail reader functions
+from database import (
+    get_emails_from_db, insert_email, update_email_status, 
+    get_user_email_count, update_user_sync_metadata, 
+    get_user_sync_metadata, create_tables
+)
+from gmail_reader import (
+    sync_latest_emails, get_older_emails, send_email, 
+    get_gmail_profile, get_gmail_messages_batch
+)
 
 # --- Groq Client Initialization ---
-# WARNING: Hardcoding API keys is a security risk. Use environment variables in production.
-GROQ_API_KEY = "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" 
+GROQ_API_KEY = "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"
 
 try:
     if not GROQ_API_KEY or GROQ_API_KEY == "YOUR_GROQ_API_KEY_HERE":
-        print("🔴 FATAL: Groq API key is not set in the code or is a placeholder. Please replace 'YOUR_GROQ_API_KEY_HERE'.")
+        print("🔴 FATAL: Groq API key is not set in the code.")
         groq_client = None
     else:
         groq_client = groq.Client(api_key=GROQ_API_KEY)
@@ -28,10 +35,7 @@ except Exception as e:
 app = FastAPI()
 
 # --- CORS Middleware ---
-origins = [
-    "http://localhost:3000", # Your Next.js frontend
-    # Add any other origins your frontend might be hosted on
-]
+origins = ["http://localhost:3000"]
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,18 +47,15 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def startup_event():
-    """
-    Ensure the database table exists on application startup.
-    """
-    create_email_table()
-    print("✅ Database table ensured to exist.")
-
+    """Ensure database tables exist on application startup"""
+    create_tables()
+    print("✅ Database tables ensured to exist.")
 
 # --- Pydantic Models ---
 class TokenPayload(BaseModel):
     access_token: str
     refresh_token: str | None = None
-    user_email: EmailStr # Use EmailStr for email validation
+    user_email: EmailStr
 
 class SendEmailPayload(BaseModel):
     access_token: str
@@ -63,251 +64,386 @@ class SendEmailPayload(BaseModel):
     body: str
     original_message_id: str | None = None
 
-class MarkEmailReadPayload(BaseModel):
-    email_id: str
-    access_token: str # Retained for potential future use or consistency
-
 class UpdateEmailStatusPayload(BaseModel):
     email_id: str
     is_read: bool | None = None
     is_replied: bool | None = None
     reply_status: str | None = None
 
-# --- NEW Model for Groq Body Generation Request ---
-class GenerateEmailBodyRequest(BaseModel):
-    access_token: str # Still pass token for frontend consistency and potential backend auth check
-    user_email: EmailStr
-    context: str # The user's prompt or context for generating the email
-    sender: EmailStr # Original sender's email
-    subject: str # Original email subject
+class SyncStatusResponse(BaseModel):
+    user_email: str
+    total_emails_in_gmail: int
+    emails_in_local_db: int
+    last_sync_timestamp: Optional[int]
+    sync_status: str
+    latest_50_synced: bool
 
+class GenerateEmailBodyRequest(BaseModel):
+    access_token: str
+    user_email: EmailStr
+    context: str
+    sender: EmailStr
+    subject: str
 
 # --- API Endpoints ---
 @app.get("/")
 async def read_root():
-    """
-    Basic health check endpoint.
-    """
-    return {"message": "FastAPI Backend is running!"}
+    return {"message": "Enhanced FastAPI Email Automation Backend is running!"}
 
 @app.post("/api/store-token")
 async def store_token(payload: TokenPayload):
-    """
-    Receives and acknowledges user tokens.
-    In a real app, you would securely store these tokens associated with a user.
-    """
-    print(f"Received token for {payload.user_email}. (Token not persistently stored in this example backend)")
-    return {"message": "Token received successfully on backend!", "email": payload.user_email}
+    """Store token and initialize user sync metadata if needed"""
+    print(f"Received token for {payload.user_email}")
+    
+    # Initialize user sync metadata if doesn't exist
+    sync_metadata = get_user_sync_metadata(payload.user_email)
+    if not sync_metadata:
+        update_user_sync_metadata(
+            user_email=payload.user_email,
+            sync_status="never_synced",
+            latest_50_synced=False
+        )
+        print(f"✅ Initialized sync metadata for {payload.user_email}")
+    
+    return {"message": "Token received successfully!", "email": payload.user_email}
+
+@app.get("/api/sync-status/{user_email}")
+async def get_sync_status(user_email: str) -> SyncStatusResponse:
+    """Get synchronization status for a user"""
+    sync_metadata = get_user_sync_metadata(user_email)
+    local_email_count = get_user_email_count(user_email)
+    
+    if not sync_metadata:
+        return SyncStatusResponse(
+            user_email=user_email,
+            total_emails_in_gmail=0,
+            emails_in_local_db=local_email_count,
+            last_sync_timestamp=None,
+            sync_status="never_synced",
+            latest_50_synced=False
+        )
+    
+    return SyncStatusResponse(
+        user_email=user_email,
+        total_emails_in_gmail=sync_metadata.get("total_emails_count", 0),
+        emails_in_local_db=local_email_count,
+        last_sync_timestamp=sync_metadata.get("last_sync_timestamp"),
+        sync_status=sync_metadata.get("sync_status", "never_synced"),
+        latest_50_synced=bool(sync_metadata.get("latest_50_synced", 0))
+    )
+
+@app.post("/api/sync-latest-emails")
+async def sync_latest_emails_endpoint(payload: TokenPayload, count: int = Query(50, le=100)):
+    """Sync the latest N emails from Gmail for the user"""
+    print(f"🔄 Syncing latest {count} emails for {payload.user_email}")
+    
+    if not payload.access_token:
+        raise HTTPException(status_code=400, detail="Access token is missing.")
+    
+    try:
+        # Update sync status to 'syncing'
+        update_user_sync_metadata(
+            user_email=payload.user_email,
+            sync_status="syncing"
+        )
+        
+        # Sync latest emails from Gmail
+        emails, sync_metadata = sync_latest_emails(
+            access_token=payload.access_token,
+            user_email=payload.user_email,
+            count=count
+        )
+        
+        # Store emails in database
+        for email_data in emails:
+            insert_email(email_data, payload.user_email)
+        
+        # Update sync metadata
+        update_user_sync_metadata(
+            user_email=payload.user_email,
+            total_emails_count=sync_metadata["total_emails_count"],
+            last_sync_timestamp=sync_metadata["last_sync_timestamp"],
+            sync_status=sync_metadata["sync_status"],
+            latest_50_synced=sync_metadata["latest_50_synced"],
+            next_page_token=sync_metadata.get("next_page_token")
+        )
+        
+        print(f"✅ Successfully synced {len(emails)} emails for {payload.user_email}")
+        
+        return {
+            "message": f"Successfully synced {len(emails)} latest emails",
+            "emails_synced": len(emails),
+            "total_emails_in_gmail": sync_metadata["total_emails_count"],
+            "user_email": payload.user_email
+        }
+        
+    except Exception as e:
+        print(f"❌ Error syncing emails for {payload.user_email}: {e}")
+        update_user_sync_metadata(
+            user_email=payload.user_email,
+            sync_status="error"
+        )
+        raise HTTPException(status_code=500, detail=f"Failed to sync emails: {str(e)}")
 
 @app.post("/api/read-emails")
 async def read_emails_and_process(
     payload: TokenPayload,
     email_id: str | None = Query(None, description="Optional email ID to fetch a specific email"),
-    fetch_new: bool = Query(True, description="Whether to fetch new emails from Gmail or rely on database only"),
-    limit: int = Query(10, description="Maximum number of emails to return")
+    fetch_new: bool = Query(False, description="Whether to fetch new emails from Gmail"),
+    limit: int = Query(50, description="Maximum number of emails to return"),
+    offset: int = Query(0, description="Offset for pagination")
 ):
     """
-    Fetches emails from Gmail (if requested) and/or the local database.
-    Does NOT perform sentiment analysis or generate suggested replies via Groq.
+    Read emails for a specific user with pagination support
+    Now properly isolated per user
     """
-    print(f"Processing /api/read-emails request. Email ID: {email_id}, Fetch New: {fetch_new}, Limit: {limit}")
+    print(f"Processing /api/read-emails request for {payload.user_email}. Email ID: {email_id}, Fetch New: {fetch_new}, Limit: {limit}, Offset: {offset}")
 
     if not payload.access_token:
         raise HTTPException(status_code=400, detail="Access token is missing.")
-    
-    retrieved_emails_from_gmail = []
-    
-    # Fetch from Gmail if 'fetch_new' is true, or if a specific email_id is requested (to ensure latest data)
-    if fetch_new or email_id:
-        try:
-            # Query for unread messages when listing. When fetching by ID, no search query is needed.
-            gmail_query = "is:unread" if not email_id else None 
-            
-            emails_from_gmail = get_gmail_messages(
-                payload.access_token,
-                max_results=20, # Keep fetching max 20 unread for initial sync
-                email_id=email_id,
-                query=gmail_query
-            )
-            retrieved_emails_from_gmail = emails_from_gmail
-
-            # Store/update fetched emails in the database
-            for email_data in emails_from_gmail:
-                # Initialize default values. Sentiment and suggested_reply_body are no longer generated.
-                email_data['sentiment'] = 'N/A' # Will always be N/A now
-                email_data['reply_status'] = email_data.get('reply_status', 'Not Replied')
-                email_data['is_read'] = 0 # Mark as unread initially (unless specifically fetched email is already read)
-                email_data['is_replied'] = 0 # Mark as unreplied initially
-                email_data['suggested_reply_body'] = None # No longer generated
-                insert_email(email_data) # Insert or update
-
-        except Exception as e:
-            print(f"❌ Error fetching emails from Gmail: {e}")
-            # Do not raise HTTPException here, allow proceeding with DB emails
-            # This allows the app to function even if Gmail API calls fail temporarily
-    
-    # --- Logic for returning emails ---
-    if email_id:
-        # If a specific email_id is requested, fetch and return only that one from DB
-        db_emails = get_emails_from_db(email_id=email_id)
-        if not db_emails:
-            # If specific email not found in DB even after trying Gmail fetch, raise 404
-            raise HTTPException(status_code=404, detail=f"Email with ID '{email_id}' not found in database.")
-        
-        email_to_return = db_emails[0]
-        # Sentiment and suggested_reply_body are not processed here
-        return {"email": {
-            "id": email_to_return["id"],
-            "from": email_to_return["from_address"],
-            "subject": email_to_return["subject"],
-            "snippet": email_to_return["snippet"],
-            "sentiment": email_to_return.get("sentiment", "N/A"), # Still returned, but will be 'N/A'
-            "reply_status": email_to_return["reply_status"],
-            "suggested_reply_body": email_to_return.get("suggested_reply_body"), # Will be None
-            "full_body": email_to_return["full_body"]
-        }}
-        
-    else: 
-        # If no specific email_id, return a list of unread/unreplied emails from DB based on filters
-        final_emails_to_return = get_emails_from_db(limit=limit, is_read=False, is_replied=False)
-        
-        # Map DB column names to frontend expected names
-        formatted_emails = [
-            {
-                "id": email["id"],
-                "from": email["from_address"],
-                "subject": email["subject"],
-                "snippet": email["snippet"],
-                "sentiment": email.get("sentiment", "N/A"), # Still returned, but will be 'N/A'
-                "reply_status": email["reply_status"],
-                "suggested_reply_body": email.get("suggested_reply_body"), # Will be None
-                "full_body": email["full_body"]
-            } for email in final_emails_to_return
-        ]
-
-        return {"emails": formatted_emails}
-
-
-@app.post("/api/send-manual-email")
-async def send_manual_email_route(payload: SendEmailPayload):
-    """
-    Sends an email using the Gmail API via `gmail_reader.py`.
-    Marks the original email as replied in the database if an `original_message_id` is provided.
-    """
-    print(f"➡️ Manually sending email to {payload.to}")
-    if not all([payload.access_token, payload.to, payload.subject, payload.body]):
-        raise HTTPException(status_code=400, detail="Missing required fields for sending an email.")
 
     try:
-        result = send_email(payload.access_token, payload.to, payload.subject, payload.body)
-        print("✅ Manual email sent. Message ID:", result.get("id"))
+        # If fetching new emails or specific email ID
+        if fetch_new or email_id:
+            if email_id:
+                # Fetch specific email from Gmail
+                emails_from_gmail, _ = get_gmail_messages_batch(
+                    access_token=payload.access_token,
+                    email_id=email_id
+                )
+                
+                # Store/update in database
+                for email_data in emails_from_gmail:
+                    insert_email(email_data, payload.user_email)
+            else:
+                # Fetch latest emails (small batch for real-time updates)
+                emails_from_gmail, next_page_token = get_gmail_messages_batch(
+                    access_token=payload.access_token,
+                    max_results=min(limit, 20),  # Limit real-time fetches
+                    query="is:unread"  # Focus on unread emails for real-time
+                )
+                
+                # Store/update in database
+                for email_data in emails_from_gmail:
+                    insert_email(email_data, payload.user_email)
+                
+                # Update sync metadata
+                update_user_sync_metadata(
+                    user_email=payload.user_email,
+                    last_sync_timestamp=int(time.time()),
+                    next_page_token=next_page_token
+                )
 
-        if payload.original_message_id:
-            # Mark the original email as replied if a message ID was provided
-            update_email_status(payload.original_message_id, is_replied=True, reply_status="User Replied")
-            print(f"Marked email {payload.original_message_id} as replied in DB.")
+        # Always return emails from database (user-specific)
+        db_emails = get_emails_from_db(
+            user_email=payload.user_email,
+            limit=limit,
+            offset=offset,
+            email_id=email_id
+        )
 
-        return {"success": True, "messageId": result.get("id")}
+        if email_id and not db_emails:
+            raise HTTPException(status_code=404, detail=f"Email with ID '{email_id}' not found.")
+
+        # Get user sync status for response metadata
+        sync_metadata = get_user_sync_metadata(payload.user_email)
+        local_count = get_user_email_count(payload.user_email)
+
+        return {
+            "emails": db_emails,
+            "total_count": local_count,
+            "offset": offset,
+            "limit": limit,
+            "has_more": len(db_emails) == limit,
+            "sync_status": sync_metadata.get("sync_status", "never_synced") if sync_metadata else "never_synced",
+            "total_emails_in_gmail": sync_metadata.get("total_emails_count", 0) if sync_metadata else 0
+        }
+
     except Exception as e:
-        print(f"❌ Error in /api/send-manual-email endpoint: {e}")
-        error_message = str(e)
-        if "invalid_grant" in error_message.lower() or "auth" in error_message.lower() or "token" in error_message.lower():
-            raise HTTPException(status_code=401, detail="Authentication error. The token may have expired. Please sign in again.")
-        raise HTTPException(status_code=500, detail=f"Failed to send email: {error_message}")
+        print(f"❌ Error reading emails for {payload.user_email}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to read emails: {str(e)}")
 
-
-@app.post("/api/mark-email-read")
-async def mark_email_read(payload: MarkEmailReadPayload):
+@app.post("/api/load-older-emails")
+async def load_older_emails(
+    payload: TokenPayload,
+    count: int = Query(50, le=100, description="Number of older emails to fetch")
+):
     """
-    Marks an email as read in the local database.
+    Load older emails from Gmail using pagination
     """
-    print(f"Attempting to mark email {payload.email_id} as read...")
+    print(f"📄 Loading {count} older emails for {payload.user_email}")
+    
+    if not payload.access_token:
+        raise HTTPException(status_code=400, detail="Access token is missing.")
+    
     try:
-        success = update_email_status(payload.email_id, is_read=True)
-        if success:
-            return {"success": True, "message": f"Email {payload.email_id} marked as read."}
-        else:
-            raise HTTPException(status_code=404, detail="Email not found or no update needed.")
+        # Get current sync metadata to find next page token
+        sync_metadata = get_user_sync_metadata(payload.user_email)
+        if not sync_metadata or not sync_metadata.get("next_page_token"):
+            return {
+                "message": "No more emails to load",
+                "emails_loaded": 0,
+                "has_more": False
+            }
+        
+        # Fetch older emails using page token
+        emails, next_page_token = get_older_emails(
+            access_token=payload.access_token,
+            page_token=sync_metadata["next_page_token"],
+            count=count
+        )
+        
+        # Store emails in database
+        for email_data in emails:
+            insert_email(email_data, payload.user_email)
+        
+        # Update sync metadata with new page token
+        update_user_sync_metadata(
+            user_email=payload.user_email,
+            next_page_token=next_page_token,
+            last_sync_timestamp=int(time.time())
+        )
+        
+        return {
+            "message": f"Successfully loaded {len(emails)} older emails",
+            "emails_loaded": len(emails),
+            "has_more": next_page_token is not None,
+            "user_email": payload.user_email
+        }
+        
     except Exception as e:
-        print(f"❌ Error marking email as read: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to mark email as read: {str(e)}")
+        print(f"❌ Error loading older emails for {payload.user_email}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to load older emails: {str(e)}")
 
-@app.post("/api/update-email-status")
-async def api_update_email_status(payload: UpdateEmailStatusPayload):
-    """
-    Updates the read, replied, or reply status of an email in the local database.
-    """
-    print(f"Attempting to update status for email {payload.email_id} with is_read={payload.is_read}, is_replied={payload.is_replied}, reply_status={payload.reply_status}...")
+@app.post("/api/send-email")
+async def send_email_endpoint(payload: SendEmailPayload):
+    """Send email via Gmail API"""
+    print(f"📤 Sending email to {payload.to}")
+    
+    if not payload.access_token:
+        raise HTTPException(status_code=400, detail="Access token is missing.")
+    
+    try:
+        response = send_email(
+            access_token=payload.access_token,
+            to=payload.to,
+            subject=payload.subject,
+            body=payload.body
+        )
+        
+        return {
+            "message": "Email sent successfully",
+            "message_id": response.get("id"),
+            "to": payload.to
+        }
+        
+    except Exception as e:
+        print(f"❌ Error sending email: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to send email: {str(e)}")
+
+@app.put("/api/update-email-status")
+async def update_email_status_endpoint(
+    payload: UpdateEmailStatusPayload,
+    user_email: str = Query(..., description="User email for email ownership verification")
+):
+    """Update email status (read/replied) for a specific user"""
+    print(f"Updating email status for {payload.email_id} (user: {user_email})")
+    
     try:
         success = update_email_status(
-            payload.email_id,
+            email_id=payload.email_id,
+            user_email=user_email,
             is_read=payload.is_read,
             is_replied=payload.is_replied,
             reply_status=payload.reply_status
         )
+        
         if success:
-            return {"success": True, "message": f"Email {payload.email_id} status updated."}
+            return {"message": "Email status updated successfully"}
         else:
             raise HTTPException(status_code=404, detail="Email not found or no update needed.")
+            
     except Exception as e:
         print(f"❌ Error updating email status: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to update email status: {str(e)}")
 
-
-# --- NEW Endpoint for Groq AI Body Generation ---
 @app.post("/api/generate-email-body")
-async def generate_email_body(request: GenerateEmailBodyRequest):
-    """
-    Generates an email body using Groq AI based on the provided context, sender, and subject.
-    """
-    if not groq_client:
-        raise HTTPException(status_code=500, detail="Groq client is not configured on the server. Check the API key initialization.")
+async def generate_email_body(payload: GenerateEmailBodyRequest):
+    """Generate email body using Groq AI"""
+    print(f"🤖 Generating email body for {payload.user_email}")
     
-    # You might want to add more robust authentication/authorization checks here
-    # beyond just having an access token. For this example, we assume presence
-    # of access_token implies frontend authentication is handled.
-
+    if not groq_client:
+        raise HTTPException(status_code=500, detail="Groq client is not configured.")
+    
     try:
-        # Construct the prompt for Groq
-        prompt_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are an AI assistant designed to help compose professional email replies or new emails. "
-                    "Focus on generating a concise, clear, and contextually appropriate email body. "
-                    "Do not include subject lines, 'To:', 'From:', salutations like 'Dear/Hi [Name]', or closings like 'Sincerely/Best regards, [Your Name]'. "
-                    "Just provide the main body content of the email."
-                )
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Compose an email. The original sender was: {request.sender}. "
-                    f"The original email subject was: {request.subject}. "
-                    f"The core context/instruction for this new email/reply is: {request.context}"
-                )
-            }
-        ]
-
-        # Call Groq API for chat completion
-        chat_completion = groq_client.chat.completions.create(
-            messages=prompt_messages,
-            model="llama3-8b-8192", # You can choose other models available on Groq (e.g., "mixtral-8x7b-32768")
-            temperature=0.7, # Adjust creativity (0.0 for deterministic, 1.0 for more creative)
-            max_tokens=500, # Limit the length of the generated body to avoid overly long responses
+        completion = groq_client.chat.completions.create(
+            messages=[
+                {
+                    "role": "system", 
+                    "content": "You are a helpful assistant that drafts professional email responses. Create clear, concise, and appropriate email content based on the user's context and the original email details."
+                },
+                {
+                    "role": "user", 
+                    "content": f"Draft an email response based on this context: {payload.context}\n\nOriginal sender: {payload.sender}\nOriginal subject: {payload.subject}\n\nPlease provide a professional and appropriate response."
+                }
+            ],
+            model="llama3-8b-8192",
+            temperature=0.7,
+            max_tokens=1000
         )
-
-        generated_body = chat_completion.choices[0].message.content.strip()
-
-        # Post-processing: Remove common salutations/closings if the model occasionally adds them
-        generated_body = re.sub(r"^(Dear|Hi|Hello)\s+[^,\n]+[,!\.]?\s*\n*", "", generated_body, flags=re.IGNORECASE)
-        generated_body = re.sub(r"\n*(Sincerely|Best regards|Thanks|Regards|Cheers)[,!\.]?\s*\[?Your Name\]?\s*$", "", generated_body, flags=re.IGNORECASE)
-        generated_body = generated_body.strip()
-
-
-        return {"success": True, "generated_body": generated_body}
-
+        
+        generated_body = completion.choices[0].message.content.strip()
+        
+        return {
+            "message": "Email body generated successfully",
+            "generated_body": generated_body,
+            "user_email": payload.user_email
+        }
+        
     except Exception as e:
         print(f"❌ Error generating email body: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to generate email body: {str(e)}")
 
+@app.delete("/api/reset-user-data/{user_email}")
+async def reset_user_data(user_email: str):
+    """Reset all data for a user (for development/testing)"""
+    try:
+        from database import get_db_connection
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Delete user emails
+        cursor.execute("DELETE FROM emails WHERE user_email = ?", (user_email,))
+        emails_deleted = cursor.rowcount
+        
+        # Delete user sync metadata
+        cursor.execute("DELETE FROM user_sync_metadata WHERE user_email = ?", (user_email,))
+        metadata_deleted = cursor.rowcount
+        
+        conn.commit()
+        conn.close()
+        
+        print(f"🗑️ Reset data for user: {user_email} - {emails_deleted} emails, {metadata_deleted} metadata records")
+        return {
+            "message": f"All data reset for user {user_email}",
+            "emails_deleted": emails_deleted,
+            "metadata_deleted": metadata_deleted
+        }
+        
+    except Exception as e:
+        print(f"❌ Error resetting user data: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to reset user data: {str(e)}")
+
+@app.get("/api/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": int(time.time()),
+        "groq_client_available": groq_client is not None
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
