@@ -484,6 +484,7 @@ async def sync_latest_emails_endpoint(payload: TokenPayload, count: int = Query(
         # Sync latest emails from Gmail
         emails, next_page_token = sync_latest_emails(
             access_token=payload.access_token,
+            user_email=str(payload.user_email),
             count=count
         )
         
