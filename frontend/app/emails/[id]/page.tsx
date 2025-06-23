@@ -67,6 +67,7 @@ export default function EmailDetailPage() {
   // Reply actions state
   const [sendStatus, setSendStatus] = useState<string>("");
   const [replyType, setReplyType] = useState<'reply' | 'reply-all' | 'forward'>('reply');
+  const [isPreviewMode, setIsPreviewMode] = useState<boolean>(false);
 
   // Email headers parsed from Gmail
   const [emailHeaders, setEmailHeaders] = useState<EmailHeaders>({});
@@ -115,70 +116,170 @@ export default function EmailDetailPage() {
 
   // Extract email address from formatted string (e.g., "Name <email@domain.com>")
   const extractEmailAddress = useCallback((emailString: string): string => {
-    const match = emailString.match(/<([^>]+)>/);
-    return match ? match[1] : emailString.trim();
+    if (!emailString) return "";
+    
+    // First try to match email in angle brackets
+    const bracketMatch = emailString.match(/<([^>]+)>/);
+    if (bracketMatch) {
+      return bracketMatch[1].trim();
+    }
+    
+    // If no brackets, try to match a valid email address
+    const emailMatch = emailString.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+    if (emailMatch) {
+      return emailMatch[0].trim();
+    }
+    
+    // If no email pattern found, return the trimmed string
+    return emailString.trim();
+  }, []);
+
+  // Format quoted reply in Gmail style
+  const formatQuotedReply = useCallback((originalEmail: Email, headers: EmailHeaders): string => {
+    const fromName = headers.from || originalEmail.from;
+    const date = originalEmail.internalDate ? new Date(parseInt(originalEmail.internalDate)).toLocaleString('en-US', {
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true
+    }) : 'Unknown Date';
+    const originalBody = originalEmail.full_body || originalEmail.snippet;
+    
+    return `\n\nOn ${date}, ${fromName} wrote:\n${originalBody.split('\n').map(line => `> ${line}`).join('\n')}`;
+  }, []);
+
+  // Format forward message in Gmail style
+  const formatForwardMessage = useCallback((originalEmail: Email, headers: EmailHeaders): string => {
+    const fromName = headers.from || originalEmail.from;
+    const date = originalEmail.internalDate ? new Date(parseInt(originalEmail.internalDate)).toLocaleString('en-US', {
+      year: 'numeric',
+      month: 'numeric',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true
+    }) : 'Unknown Date';
+    const originalBody = originalEmail.full_body || originalEmail.snippet;
+    
+    console.log("📧 Original email body for forward:", originalBody);
+    console.log("📧 Original email full_body:", originalEmail.full_body);
+    console.log("📧 Original email snippet:", originalEmail.snippet);
+    
+    // Format recipients properly
+    const formatRecipients = (recipients: string | undefined) => {
+      if (!recipients) return 'Unknown Recipients';
+      return recipients.split(',').map(addr => addr.trim()).join(', ');
+    };
+    
+    const toRecipients = formatRecipients(headers.to);
+    const ccRecipients = headers.cc ? `\nCc: ${formatRecipients(headers.cc)}` : '';
+    
+    // Create Gmail-style forward message
+    const forwardHeader = `---------- Forwarded message ---------\nFrom: ${fromName}\nDate: ${date}\nSubject: ${originalEmail.subject}\nTo: ${toRecipients}${ccRecipients}\n\n`;
+    
+    // Preserve the original content exactly as it is, including HTML
+    const forwardMessage = forwardHeader + originalBody;
+    console.log("📤 Final forward message:", forwardMessage);
+    
+    return forwardMessage;
   }, []);
 
   // Set up reply recipients based on reply type
-  const setupReplyRecipients = useCallback((type: 'reply' | 'reply-all' | 'forward') => {
-    if (!email) return;
+  const setupReplyRecipients = useCallback((type: 'reply' | 'reply-all' | 'forward', emailData?: Email) => {
+    const targetEmail = emailData || email;
+    if (!targetEmail) return;
 
-    const headers = parseEmailHeaders(email);
-    const fromAddress = extractEmailAddress(headers.from || email.from);
+    console.log("🔧 Setting up reply recipients for type:", type);
+    console.log("📧 Target email:", targetEmail);
+
+    const headers = parseEmailHeaders(targetEmail);
+    console.log("📋 Parsed headers:", headers);
+
+    const fromAddress = extractEmailAddress(headers.from || targetEmail.from);
     const replyToAddress = headers.replyTo ? extractEmailAddress(headers.replyTo) : fromAddress;
+
+    console.log("👤 From address:", fromAddress);
+    console.log("📬 Reply-to address:", replyToAddress);
 
     setReplyType(type);
 
     switch (type) {
       case 'reply':
+        console.log("💬 Setting up reply to:", replyToAddress);
         setReplyTo(replyToAddress);
         setCcAddresses("");
         setBccAddresses("");
-        setReplySubject(email.subject.startsWith('Re: ') ? email.subject : `Re: ${email.subject}`);
+        setReplySubject(targetEmail.subject.startsWith('Re: ') ? targetEmail.subject : `Re: ${targetEmail.subject}`);
+        // Start with empty body for reply
+        setReplyBody("");
         break;
 
       case 'reply-all':
+        console.log("📢 Setting up reply-all to:", replyToAddress);
         setReplyTo(replyToAddress);
         
         // Add original To and CC recipients (excluding our own email)
         const userEmail = session?.user?.email?.toLowerCase();
         const allRecipients = new Set<string>();
         
+        console.log("👤 Current user email:", userEmail);
+        
+        // Add original To recipients
         if (headers.to) {
+          console.log("📨 Original To recipients:", headers.to);
           headers.to.split(',').forEach(addr => {
             const cleanAddr = extractEmailAddress(addr.trim()).toLowerCase();
+            console.log("🔍 Processing To address:", addr.trim(), "->", cleanAddr);
             if (cleanAddr !== userEmail && cleanAddr !== replyToAddress.toLowerCase()) {
               allRecipients.add(addr.trim());
+              console.log("✅ Added To recipient:", addr.trim());
+            } else {
+              console.log("❌ Excluded To recipient:", addr.trim());
             }
           });
         }
         
+        // Add original CC recipients
         if (headers.cc) {
+          console.log("📋 Original CC recipients:", headers.cc);
           headers.cc.split(',').forEach(addr => {
             const cleanAddr = extractEmailAddress(addr.trim()).toLowerCase();
+            console.log("🔍 Processing CC address:", addr.trim(), "->", cleanAddr);
             if (cleanAddr !== userEmail && cleanAddr !== replyToAddress.toLowerCase()) {
               allRecipients.add(addr.trim());
+              console.log("✅ Added CC recipient:", addr.trim());
+            } else {
+              console.log("❌ Excluded CC recipient:", addr.trim());
             }
           });
         }
         
-        setCcAddresses(Array.from(allRecipients).join(', '));
+        const ccList = Array.from(allRecipients).join(', ');
+        console.log("📝 Final CC list:", ccList);
+        setCcAddresses(ccList);
         setBccAddresses("");
-        setReplySubject(email.subject.startsWith('Re: ') ? email.subject : `Re: ${email.subject}`);
+        setReplySubject(targetEmail.subject.startsWith('Re: ') ? targetEmail.subject : `Re: ${targetEmail.subject}`);
+        // Start with empty body for reply-all
+        setReplyBody("");
         break;
 
       case 'forward':
+        console.log("📤 Setting up forward");
         setReplyTo("");
         setCcAddresses("");
         setBccAddresses("");
-        setReplySubject(email.subject.startsWith('Fwd: ') ? email.subject : `Fwd: ${email.subject}`);
+        setReplySubject(targetEmail.subject.startsWith('Fwd: ') ? targetEmail.subject : `Fwd: ${targetEmail.subject}`);
         
-        // Pre-populate forward body with original message
-        const forwardBody = `\n\n---------- Forwarded message ---------\nFrom: ${email.from}\nDate: ${new Date(parseInt(email.internalDate || '0')).toLocaleString()}\nSubject: ${email.subject}\nTo: ${headers.to || ''}\n\n${email.full_body || email.snippet}`;
-        setReplyBody(forwardBody);
+        // Pre-populate forward body with original message in Gmail format
+        setReplyBody(formatForwardMessage(targetEmail, headers));
+        
+        // Automatically switch to preview mode for forward messages since they contain HTML
+        setIsPreviewMode(true);
         break;
     }
-  }, [email, session?.user?.email, parseEmailHeaders, extractEmailAddress]);
+  }, [email, session?.user?.email, parseEmailHeaders, extractEmailAddress, formatQuotedReply, formatForwardMessage]);
 
   // Fetch email details - MEMOIZED and controlled
   const fetchEmailDetails = useCallback(async () => {
@@ -226,10 +327,8 @@ export default function EmailDetailPage() {
         setEmail(data.email);
         setEmailHeaders(parseEmailHeaders(data.email));
         
-        // Set up default reply (only once when email is loaded)
-        setTimeout(() => {
-          setupReplyRecipients('reply');
-        }, 100);
+        // Set up default reply immediately when email is loaded
+        setupReplyRecipients('reply', data.email);
       } else {
         console.error("❌ No email in response:", data);
         throw new Error("Email data not found in response");
@@ -432,7 +531,7 @@ export default function EmailDetailPage() {
     if (!email?.suggested_reply_body) return;
     
     setReplyBody(email.suggested_reply_body);
-    setupReplyRecipients('reply');
+    setupReplyRecipients('reply', email);
     
     // Auto-send after a brief delay to allow state update
     setTimeout(() => {
@@ -547,9 +646,9 @@ export default function EmailDetailPage() {
       {/* Quick Actions */}
       <section className="mb-6 p-4 border rounded-lg bg-white shadow-sm">
         <h3 className="text-lg font-semibold mb-3">Quick Actions</h3>
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap gap-2 mb-3">
           <button
-            onClick={() => setupReplyRecipients('reply')}
+            onClick={() => setupReplyRecipients('reply', email)}
             className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
               replyType === 'reply' 
                 ? 'bg-blue-600 text-white' 
@@ -559,7 +658,7 @@ export default function EmailDetailPage() {
             Reply
           </button>
           <button
-            onClick={() => setupReplyRecipients('reply-all')}
+            onClick={() => setupReplyRecipients('reply-all', email)}
             className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
               replyType === 'reply-all' 
                 ? 'bg-blue-600 text-white' 
@@ -569,7 +668,7 @@ export default function EmailDetailPage() {
             Reply All
           </button>
           <button
-            onClick={() => setupReplyRecipients('forward')}
+            onClick={() => setupReplyRecipients('forward', email)}
             className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
               replyType === 'forward' 
                 ? 'bg-blue-600 text-white' 
@@ -705,18 +804,56 @@ export default function EmailDetailPage() {
             <label htmlFor="replyBody" className="block text-sm font-medium text-gray-700 mb-1">
               Message:
             </label>
-            <textarea
-              id="replyBody"
-              value={replyBody}
-              onChange={(e) => setReplyBody(e.target.value)}
-              className="w-full p-3 border rounded-md focus:ring-blue-500 focus:border-blue-500 min-h-[250px] font-mono text-sm"
-              placeholder={
-                aiGenerating 
-                  ? "Generating AI reply..." 
-                  : `Type your ${replyType} here...`
-              }
-              disabled={aiGenerating}
-            />
+            <div className="flex items-center gap-2 mb-2">
+              {(replyType === 'reply' || replyType === 'reply-all') && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const headers = parseEmailHeaders(email);
+                    const quotedText = formatQuotedReply(email, headers);
+                    setReplyBody(prev => prev + quotedText);
+                  }}
+                  className="px-3 py-1 text-xs bg-gray-100 text-gray-700 rounded-md hover:bg-gray-200 transition-colors"
+                >
+                  Include Original Message
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => setIsPreviewMode(!isPreviewMode)}
+                className="px-3 py-1 text-xs bg-blue-100 text-blue-700 rounded-md hover:bg-blue-200 transition-colors"
+              >
+                {isPreviewMode ? 'Edit' : 'Preview'}
+              </button>
+            </div>
+            
+            {isPreviewMode ? (
+              <div className="w-full p-3 border rounded-md min-h-[250px] bg-white overflow-y-auto">
+                <div 
+                  className="prose max-w-none text-sm"
+                  style={{ 
+                    fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+                    lineHeight: '1.5'
+                  }}
+                  dangerouslySetInnerHTML={{ 
+                    __html: DOMPurify.sanitize(replyBody || '<p style="color: #666; font-style: italic;">No content to preview</p>') 
+                  }}
+                />
+              </div>
+            ) : (
+              <textarea
+                id="replyBody"
+                value={replyBody}
+                onChange={(e) => setReplyBody(e.target.value)}
+                className="w-full p-3 border rounded-md focus:ring-blue-500 focus:border-blue-500 min-h-[250px] font-mono text-sm"
+                placeholder={
+                  aiGenerating 
+                    ? "Generating AI reply..." 
+                    : `Type your ${replyType} here...`
+                }
+                disabled={aiGenerating}
+              />
+            )}
           </div>
 
           <div className="flex items-center justify-between">
