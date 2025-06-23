@@ -30,7 +30,8 @@ from gmail_reader import (
 )
 
 # --- Groq Client Initialization ---
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "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")
+# Paste your Groq API key below. Do NOT use .env or environment variables for this key.
+GROQ_API_KEY = "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"  # <-- Paste your Groq API key here (e.g., gsk_xxx...)
 
 try:
     if not GROQ_API_KEY or GROQ_API_KEY == "YOUR_GROQ_API_KEY_HERE":
