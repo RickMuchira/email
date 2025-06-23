@@ -146,13 +146,19 @@ def parse_gmail_message(data: Dict) -> Optional[Dict]:
         return None
 
 def extract_email_body(payload: Dict) -> str:
-    """Extract email body from Gmail payload"""
-    full_body = ""
+    """Extract email body from Gmail payload, preferring HTML if available."""
+    html_body = ""
+    plain_body = ""
     
     # Check for simple body (no parts)
     if not payload.get("parts") and payload.get("body", {}).get("data"):
         try:
-            full_body = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8")
+            mime_type = payload.get("mimeType")
+            decoded = base64.urlsafe_b64decode(payload["body"]["data"]).decode("utf-8")
+            if mime_type == "text/html":
+                html_body = decoded
+            else:
+                plain_body = decoded
         except Exception as e:
             print(f"Error decoding simple body: {e}")
     else:
@@ -161,19 +167,17 @@ def extract_email_body(payload: Dict) -> str:
         for part in parts:
             mime_type = part.get("mimeType")
             body_data = part.get("body", {}).get("data")
-            
-            if body_data and mime_type in ["text/plain", "text/html"]:
+            if body_data:
                 try:
-                    decoded_body = base64.urlsafe_b64decode(body_data).decode("utf-8")
-                    if mime_type == "text/plain":
-                        full_body = decoded_body
-                        break  # Prefer plain text
-                    elif not full_body:  # Use HTML if no plain text found
-                        full_body = decoded_body
+                    decoded = base64.urlsafe_b64decode(body_data).decode("utf-8")
+                    if mime_type == "text/html":
+                        html_body = decoded
+                    elif mime_type == "text/plain" and not plain_body:
+                        plain_body = decoded
                 except Exception as e:
                     print(f"Error decoding part body for type {mime_type}: {e}")
     
-    return full_body
+    return html_body if html_body else plain_body
 
 def sync_latest_emails(access_token: str, user_email: str, count: int = 50) -> Tuple[List[Dict], Dict]:
     """
