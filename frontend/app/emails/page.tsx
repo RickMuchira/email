@@ -5,6 +5,10 @@
 import { useSession, signIn, signOut } from "next-auth/react";
 import { useRouter } from "next/navigation";
 import { useState, useEffect, useCallback } from "react";
+import PriorityBadge from "@/components/PriorityBadge";
+import SentimentBadge from "@/components/SentimentBadge";
+import PriorityFilterBar from "@/components/PriorityFilterBar";
+import SentimentFilterBar from "@/components/SentimentFilterBar";
 
 interface Email {
   id: string;
@@ -15,6 +19,12 @@ interface Email {
   snippet: string;
   internalDate: string;
   sentiment?: string;
+  sentiment_display?: string;
+  priority_level?: number;
+  priority_name?: string;
+  confidence?: number;
+  requires_immediate_attention?: boolean;
+  auto_reply_suggested?: boolean;
   reply_status?: string;
   suggested_reply_body?: string;
   full_body?: string;
@@ -55,6 +65,8 @@ export default function EmailPage() {
   const [emailResponse, setEmailResponse] = useState<EmailResponse | null>(null);
   const [offset, setOffset] = useState(0);
   const [hasInitialSync, setHasInitialSync] = useState(false);
+  const [selectedPriorities, setSelectedPriorities] = useState<number[]>([1, 2, 3, 4, 5]);
+  const [selectedSentiment, setSelectedSentiment] = useState<string>("ALL");
   const router = useRouter();
 
   const EMAILS_PER_PAGE = 50;
@@ -366,6 +378,13 @@ export default function EmailPage() {
     }
   };
 
+  // Filter emails by selected priorities and sentiment
+  const filteredEmails = emails.filter(
+    (email) =>
+      (!email.priority_level || selectedPriorities.includes(email.priority_level)) &&
+      (selectedSentiment === "ALL" || email.sentiment === selectedSentiment)
+  );
+
   if (status === "loading") {
     return (
       <div className="min-h-screen bg-gray-50 flex items-center justify-center">
@@ -562,6 +581,17 @@ export default function EmailPage() {
       {/* Email List */}
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 pb-8">
         <div className="bg-white shadow-sm rounded-lg overflow-hidden">
+          {/* Filter Bars */}
+          <div className="px-6 pt-4 flex flex-wrap gap-4 items-end">
+            <PriorityFilterBar
+              selectedPriorities={selectedPriorities}
+              onChange={setSelectedPriorities}
+            />
+            <SentimentFilterBar
+              selectedSentiment={selectedSentiment}
+              onChange={setSelectedSentiment}
+            />
+          </div>
           <div className="px-6 py-4 border-b border-gray-200">
             <div className="flex justify-between items-center">
               <h2 className="text-lg font-medium text-gray-900">
@@ -607,7 +637,7 @@ export default function EmailPage() {
           ) : (
             <>
               <div className="divide-y divide-gray-200">
-                {emails.map((email) => (
+                {filteredEmails.map((email) => (
                   <div
                     key={`${email.id}-${email.user_email}`}
                     onClick={() => handleEmailClick(email.id)}
@@ -626,13 +656,16 @@ export default function EmailPage() {
                               Unread
                             </span>
                           )}
-                          {email.sentiment && email.sentiment !== "N/A" && (
-                            <span className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-medium ${
-                              email.sentiment === "POSITIVE" ? "bg-green-100 text-green-800" :
-                              email.sentiment === "NEGATIVE" ? "bg-red-100 text-red-800" :
-                              "bg-gray-100 text-gray-800"
-                            }`}>
-                              {email.sentiment}
+                          {/* Priority Name */}
+                          {email.priority_name && (
+                            <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-800 border border-gray-200">
+                              {email.priority_name}
+                            </span>
+                          )}
+                          {/* Sentiment Name */}
+                          {email.sentiment_display && (
+                            <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-gray-50 text-gray-700 border border-gray-200">
+                              {email.sentiment_display}
                             </span>
                           )}
                           {email.is_replied === 1 && (

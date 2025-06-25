@@ -2,6 +2,9 @@
 
 import sqlite3
 from typing import List, Dict, Optional
+import json
+import time
+from enhanced_sentiment_system import SENTIMENT_CATEGORIES, PRIORITY_LEVELS
 
 DATABASE_URL = "emails.db"  # This will create a file in your backend directory
 
@@ -332,8 +335,13 @@ def update_user_sync_metadata(
     """Update or insert user sync metadata"""
     conn = get_db_connection()
     cursor = conn.cursor()
-    
     try:
+        # Convert dicts to JSON strings if needed
+        if isinstance(next_page_token, dict):
+            next_page_token = json.dumps(next_page_token)
+        if isinstance(sync_status, dict):
+            sync_status = json.dumps(sync_status)
+        
         # Check if record exists
         cursor.execute("SELECT user_email FROM user_sync_metadata WHERE user_email = ?", 
                        (user_email,))
@@ -493,7 +501,6 @@ def cleanup_old_emails(days_old: int = 30) -> int:
     
     try:
         # Calculate timestamp for cutoff (30 days ago)
-        import time
         cutoff_timestamp = int(time.time() - (days_old * 24 * 60 * 60)) * 1000  # Convert to milliseconds
         
         cursor.execute("""
@@ -546,6 +553,205 @@ def check_database_health() -> bool:
         
     except Exception as e:
         print(f"❌ Database health check failed: {e}")
+        return False
+
+def update_database_schema_for_enhanced_sentiment():
+    """Update database schema to support enhanced sentiment analysis"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        print("🔧 Updating database schema for enhanced sentiment analysis...")
+        cursor.execute("PRAGMA table_info(emails)")
+        existing_columns = [column[1] for column in cursor.fetchall()]
+        new_columns = [
+            ("sentiment_display", "TEXT DEFAULT 'N/A'"),
+            ("priority_level", "INTEGER DEFAULT 5"),
+            ("priority_name", "TEXT DEFAULT 'Very Low'"),
+            ("confidence", "INTEGER DEFAULT 0"),
+            ("requires_immediate_attention", "BOOLEAN DEFAULT FALSE"),
+            ("analysis_details", "TEXT DEFAULT '{}'"),
+            ("auto_reply_suggested", "BOOLEAN DEFAULT FALSE")
+        ]
+        for column_name, column_definition in new_columns:
+            if column_name not in existing_columns:
+                print(f"📝 Adding column: {column_name}")
+                cursor.execute(f"ALTER TABLE emails ADD COLUMN {column_name} {column_definition}")
+        indexes = [
+            "CREATE INDEX IF NOT EXISTS idx_emails_priority_level ON emails(priority_level);",
+            "CREATE INDEX IF NOT EXISTS idx_emails_immediate_attention ON emails(requires_immediate_attention);",
+            "CREATE INDEX IF NOT EXISTS idx_emails_priority_user ON emails(priority_level, user_email);",
+            "CREATE INDEX IF NOT EXISTS idx_emails_sentiment_priority ON emails(sentiment, priority_level);"
+        ]
+        for index_sql in indexes:
+            cursor.execute(index_sql)
+            print(f"📊 Created index: {index_sql.split('idx_')[1].split(' ')[0]}")
+        cursor.execute("""
+            CREATE VIEW IF NOT EXISTS priority_emails AS
+            SELECT 
+                id, user_email, from_address, subject, snippet, sentiment, 
+                sentiment_display, priority_level, priority_name, 
+                requires_immediate_attention, internalDate, is_read, is_replied,
+                suggested_reply_body, reply_status
+            FROM emails 
+            WHERE priority_level <= 3 
+            ORDER BY priority_level ASC, internalDate DESC
+        """)
+        print("📋 Created priority_emails view")
+        conn.commit()
+        print("✅ Database schema update completed successfully")
+    except Exception as e:
+        print(f"❌ Database schema update failed: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+def get_priority_emails(user_email: str, priority_threshold: int = 3) -> List[Dict]:
+    """Get high-priority emails for a user"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT * FROM emails 
+            WHERE user_email = ? AND priority_level <= ?
+            ORDER BY priority_level ASC, internalDate DESC
+            LIMIT 20
+        """, (user_email, priority_threshold))
+        rows = cursor.fetchall()
+        emails = [dict(row) for row in rows]
+        print(f"🚨 Found {len(emails)} high-priority emails for {user_email}")
+        return emails
+    except Exception as e:
+        print(f"❌ Error fetching priority emails: {e}")
+        return []
+    finally:
+        conn.close()
+
+def get_emails_by_sentiment_category(user_email: str, categories: List[str]) -> List[Dict]:
+    """Get emails filtered by sentiment categories"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        placeholders = ','.join(['?' for _ in categories])
+        query = f"""
+            SELECT * FROM emails 
+            WHERE user_email = ? AND sentiment IN ({placeholders})
+            ORDER BY priority_level ASC, internalDate DESC
+        """
+        cursor.execute(query, [user_email] + categories)
+        rows = cursor.fetchall()
+        emails = [dict(row) for row in rows]
+        print(f"📊 Found {len(emails)} emails in categories {categories} for {user_email}")
+        return emails
+    except Exception as e:
+        print(f"❌ Error fetching emails by sentiment: {e}")
+        return []
+    finally:
+        conn.close()
+
+def get_sentiment_analytics(user_email: str) -> Dict:
+    """Get detailed sentiment analytics for a user"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("""
+            SELECT sentiment, sentiment_display, COUNT(*) as count,
+                   AVG(priority_level) as avg_priority,
+                   SUM(CASE WHEN requires_immediate_attention = 1 THEN 1 ELSE 0 END) as urgent_count
+            FROM emails 
+            WHERE user_email = ?
+            GROUP BY sentiment, sentiment_display
+            ORDER BY count DESC
+        """, (user_email,))
+        sentiment_distribution = [dict(row) for row in cursor.fetchall()]
+        cursor.execute("""
+            SELECT priority_level, priority_name, COUNT(*) as count
+            FROM emails 
+            WHERE user_email = ?
+            GROUP BY priority_level, priority_name
+            ORDER BY priority_level ASC
+        """, (user_email,))
+        priority_distribution = [dict(row) for row in cursor.fetchall()]
+        cursor.execute("""
+            SELECT COUNT(*) as urgent_count
+            FROM emails 
+            WHERE user_email = ? AND requires_immediate_attention = 1 AND is_replied = 0
+        """, (user_email,))
+        urgent_unreplied = cursor.fetchone()[0]
+        cursor.execute("""
+            SELECT 
+                AVG(CASE WHEN priority_level <= 2 THEN 
+                    (julianday('now') - julianday(datetime(internalDate/1000, 'unixepoch'))) * 24 
+                END) as avg_high_priority_response_hours,
+                COUNT(CASE WHEN priority_level <= 2 AND is_replied = 0 THEN 1 END) as high_priority_pending
+            FROM emails 
+            WHERE user_email = ?
+        """, (user_email,))
+        response_analytics = dict(cursor.fetchone())
+        analytics = {
+            "sentiment_distribution": sentiment_distribution,
+            "priority_distribution": priority_distribution,
+            "urgent_unreplied": urgent_unreplied,
+            "response_analytics": response_analytics,
+            "total_emails": sum(item["count"] for item in sentiment_distribution)
+        }
+        print(f"📈 Generated sentiment analytics for {user_email}")
+        return analytics
+    except Exception as e:
+        print(f"❌ Error generating sentiment analytics: {e}")
+        return {}
+    finally:
+        conn.close()
+
+def migrate_existing_sentiment_data():
+    """Migrate existing POSITIVE/NEGATIVE/NEUTRAL data to new categories"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    try:
+        print("🔄 Migrating existing sentiment data...")
+        migration_map = {
+            'POSITIVE': 'APPRECIATION',
+            'NEGATIVE': 'COMPLAINT', 
+            'NEUTRAL': 'INFORMATIONAL',
+            'N/A': 'INFORMATIONAL'
+        }
+        for old_sentiment, new_category in migration_map.items():
+            category_info = SENTIMENT_CATEGORIES.get(new_category, {})
+            cursor.execute("""
+                UPDATE emails 
+                SET sentiment = ?, 
+                    sentiment_display = ?,
+                    priority_level = ?,
+                    priority_name = ?,
+                    requires_immediate_attention = ?
+                WHERE sentiment = ?
+            """, (
+                new_category,
+                category_info.get('display_name', new_category),
+                category_info.get('priority', 5),
+                'Medium' if category_info.get('priority', 5) == 3 else 'Low',
+                int(category_info.get('priority', 5) <= 2),
+                old_sentiment
+            ))
+            updated_count = cursor.rowcount
+            print(f"📝 Migrated {updated_count} emails from {old_sentiment} to {new_category}")
+        conn.commit()
+        print("✅ Sentiment data migration completed")
+    except Exception as e:
+        print(f"❌ Migration failed: {e}")
+        conn.rollback()
+    finally:
+        conn.close()
+
+def initialize_enhanced_sentiment_system():
+    """Initialize the enhanced sentiment system"""
+    try:
+        print("🚀 Initializing Enhanced Sentiment System...")
+        update_database_schema_for_enhanced_sentiment()
+        migrate_existing_sentiment_data()
+        print("✅ Enhanced Sentiment System initialized successfully!")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to initialize enhanced sentiment system: {e}")
         return False
 
 # Initialize database on import

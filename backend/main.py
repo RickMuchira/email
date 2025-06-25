@@ -14,6 +14,7 @@ import json
 import requests
 import os
 from dotenv import load_dotenv
+from enhanced_sentiment_system import process_email_with_enhanced_ai
 
 # Load environment variables
 load_dotenv()
@@ -22,7 +23,7 @@ load_dotenv()
 from database import (
     get_emails_from_db, insert_email, update_email_status, 
     get_user_email_count, update_user_sync_metadata, 
-    get_user_sync_metadata, create_tables, get_db_connection
+    get_user_sync_metadata, create_tables, get_db_connection, initialize_enhanced_sentiment_system
 )
 from gmail_reader import (
     sync_latest_emails, get_older_emails, send_email, 
@@ -73,6 +74,10 @@ def normalize_email_fields(email_data: dict) -> dict:
         "subject": data.get("subject", ""),
         "snippet": data.get("snippet", ""),
         "sentiment": data.get("sentiment", "N/A"),
+        "sentiment_display": data.get("sentiment_display"),
+        "priority_level": data.get("priority_level"),
+        "priority_name": data.get("priority_name"),
+        "confidence": data.get("confidence"),
         "reply_status": data.get("reply_status", "Not Replied"),
         "suggested_reply_body": data.get("suggested_reply_body"),
         "full_body": data.get("full_body", ""),
@@ -85,82 +90,10 @@ def normalize_email_fields(email_data: dict) -> dict:
     }
 
 def process_email_with_ai(email_data: dict) -> dict:
-    """Process email with AI for sentiment and reply suggestion - NON-BLOCKING"""
-    # Always set default values first so email displays regardless of AI success
-    if not email_data.get('sentiment'):
-        email_data['sentiment'] = "N/A"
-    if not email_data.get('reply_status'):
-        email_data['reply_status'] = "Not Replied"
-    
-    # Skip AI processing if Groq client not available
-    if not groq_client:
-        print("⚠️ Groq client not available, using defaults")
-        return email_data
-    
-    # Skip if already processed successfully
-    if email_data.get('sentiment') not in ['N/A', 'Error', None]:
-        print(f"📋 Email already processed: {email_data.get('sentiment')}")
-        return email_data
-
-    try:
-        print(f"🤖 Attempting AI processing for: {email_data.get('id', 'Unknown')}")
-        
-        # Analyze sentiment
-        sentiment_completion = groq_client.chat.completions.create(
-            messages=[
-                {
-                    "role": "system", 
-                    "content": "Analyze the sentiment of the following email. Respond with only one word: POSITIVE, NEGATIVE, or NEUTRAL."
-                },
-                {
-                    "role": "user", 
-                    "content": f"From: {email_data.get('from', '')}\nSubject: {email_data.get('subject', '')}\nContent: {email_data.get('snippet', '')}"
-                }
-            ],
-            model="llama3-8b-8192",
-            temperature=0.1
-        )
-        
-        sentiment = sentiment_completion.choices[0].message.content.strip().upper()
-        if sentiment in ['POSITIVE', 'NEGATIVE', 'NEUTRAL']:
-            email_data['sentiment'] = sentiment
-            print(f"✅ AI sentiment analysis successful: {sentiment}")
-            
-            # Generate reply suggestion for negative emails
-            if sentiment == "NEGATIVE":
-                try:
-                    print(f"🤖 Generating reply suggestion for negative email")
-                    reply_completion = groq_client.chat.completions.create(
-                        messages=[
-                            {
-                                "role": "system", 
-                                "content": "You are a helpful assistant. Draft a polite, professional, and empathetic email reply. Acknowledge the user's concerns and assure them you will investigate promptly. Keep it concise and professional."
-                            },
-                            {
-                                "role": "user", 
-                                "content": f"Draft a reply to this email:\n\nFrom: {email_data.get('from', '')}\nSubject: {email_data.get('subject', '')}\nContent: {email_data.get('full_body', email_data.get('snippet', ''))}"
-                            }
-                        ],
-                        model="llama3-8b-8192",
-                        temperature=0.7
-                    )
-                    
-                    email_data['suggested_reply_body'] = reply_completion.choices[0].message.content.strip()
-                    email_data['reply_status'] = "Pending User Review"
-                    print(f"✅ Reply suggestion generated")
-                except Exception as e:
-                    print(f"⚠️ Reply generation failed: {e}")
-                    email_data['reply_status'] = "Not Replied"
-        else:
-            print(f"⚠️ Unexpected sentiment result: {sentiment}")
-            email_data['sentiment'] = "N/A"
-            
-    except Exception as e:
-        print(f"⚠️ AI processing failed (non-critical): {e}")
-        # Keep defaults, don't block email display
-        email_data['sentiment'] = "Error"
-    
-    return email_data
+    """Process email with enhanced AI for sentiment and reply suggestion (ENHANCED)"""
+    # You may need to pass the groq_client if it's a global or context variable
+    global groq_client
+    return process_email_with_enhanced_ai(email_data, groq_client)
 
 def update_database_schema():
     """Add user_email column if it doesn't exist"""
@@ -367,11 +300,16 @@ def insert_email_enhanced(email_data: dict, user_email: str):
         conn.close()
 
 @app.on_event("startup")
-async def startup_event():
-    """Ensure database tables exist on application startup"""
-    create_tables()
-    update_database_schema()
-    print("✅ Database initialization completed")
+async def enhanced_startup_event():
+    """Enhanced startup to initialize sentiment system"""
+    try:
+        create_tables()
+        update_database_schema()
+        # Initialize enhanced sentiment system
+        initialize_enhanced_sentiment_system()
+        print("✅ Enhanced Email Automation System initialized successfully!")
+    except Exception as e:
+        print(f"❌ Enhanced system initialization failed: {e}")
 
 # --- Pydantic Models ---
 class TokenPayload(BaseModel):
